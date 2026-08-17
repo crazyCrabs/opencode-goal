@@ -141,12 +141,13 @@ export class GoalStore {
     this.runtime.waitReason = value
   }
 
-  /** Current goal view including process-local state. */
+  /** Current goal view including process-local state and live usage overlay. */
   view(): GoalView | undefined {
     const goal = this.state.goal
     if (goal === undefined) return undefined
     return {
       ...goal,
+      usage: this.effectiveUsage(goal),
       activation: this.runtime.activation,
       tokenBudget: this.runtime.tokenBudget,
       waitUntil: this.runtime.waitUntil,
