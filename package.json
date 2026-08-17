@@ -1,0 +1,30 @@
+{
+  "name": "opencode-goal",
+  "version": "0.1.0",
+  "description": "Persistent autonomous goals for opencode. Event-sourced goal state (DSH-style) with safety guardrails (pi-goal-style): round limits, token budgets, no-progress detection, stale-turn guards.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir dist --target bun",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "keywords": ["opencode", "plugin", "goal", "autonomous", "agent"],
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.1.42",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  }
+}
