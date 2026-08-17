@@ -64,7 +64,16 @@ export const OpenCodeGoalPlugin: Plugin = async ({ client, directory, worktree }
 
     'command.execute.before': async (input, output) => {
       if (input.command !== 'goal') return
-      const store = getStore(root)
+      // resolve the session's project directory so tools, commands, and the
+      // driver all share one store key
+      let dir = root
+      try {
+        const session = await client.session.get({ path: { id: input.sessionID } })
+        if (session.data?.directory && session.data.directory.length > 0) dir = session.data.directory
+      } catch {
+        // fall back to the plugin root
+      }
+      const store = getStore(dir)
       let result: string
       try {
         result = executeGoalCommand(store, parseGoalCommand(input.arguments))
@@ -113,7 +122,16 @@ export const OpenCodeGoalPlugin: Plugin = async ({ client, directory, worktree }
     },
 
     'experimental.chat.system.transform': async (input, output) => {
-      const store = getStore(root)
+      let dir = root
+      if (input.sessionID !== undefined) {
+        try {
+          const session = await client.session.get({ path: { id: input.sessionID } })
+          if (session.data?.directory && session.data.directory.length > 0) dir = session.data.directory
+        } catch {
+          // fall back to the plugin root
+        }
+      }
+      const store = getStore(dir)
       const goal = store.view()
       if (goal === undefined || goal.phase !== 'active') return
       const budget = goal.tokenBudget > 0
