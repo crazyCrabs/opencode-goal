@@ -1,5 +1,5 @@
 {
-  "name": "opencode-goal",
+  "name": "@crazycrabs/opencode-goal",
   "version": "0.1.0",
   "description": "Persistent autonomous goals for opencode. Event-sourced goal state (DSH-style) with safety guardrails (pi-goal-style): round limits, token budgets, no-progress detection, stale-turn guards.",
   "type": "module",
@@ -11,9 +11,9 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir dist --target bun",
+    "build": "bun build ./src/index.ts --outdir dist --target bun && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
