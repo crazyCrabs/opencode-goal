@@ -111,6 +111,13 @@ const DEFAULT_REFRESH_INTERVAL_MS = 1000
 const STATUS_TOAST_MS = 8000
 /** Toast lifetime for short mutation confirmations. */
 const ACTION_TOAST_MS = 5000
+/**
+ * Why an armed goal stays quiet with no session open: the driver and the
+ * first-round kick both need a session to run in, and a goal created from the
+ * home route is armed but has nowhere to execute yet.
+ */
+const NO_SESSION_HINT =
+  'No session is open in this project, so the goal is armed but idle. Open a session here, then run /goal resume to start it.'
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -244,7 +251,12 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
          */
         const kickRound = async (store: GoalStore): Promise<void> => {
           const id = sessionID()
-          if (id.length === 0) return
+          if (id.length === 0) {
+            // nothing can run the round here: say so instead of going silent
+            // after a successful create/edit/resume
+            toast('info', NO_SESSION_HINT, ACTION_TOAST_MS)
+            return
+          }
           if (isRunning(context, id)) return // a turn is active; the driver admits the next round at idle
           const goal = store.view()
           if (goal === undefined || goal.phase !== 'active') return

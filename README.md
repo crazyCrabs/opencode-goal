@@ -59,6 +59,20 @@ A bare `/goal` with no goal set opens a prompt for the objective. The same
 actions are available in the command palette (`Goal: …` group) and in the
 sidebar row, which shows the phase, objective, and round/budget progress.
 
+A goal only runs inside an opencode **session in that project** — it is not a
+background daemon. Two things start a round:
+
+1. The first round right after `/goal create|edit|resume`, when the TUI's
+   current route is a session. Created from the home route (no session open),
+   the goal is armed but idle and the command says so.
+2. Every further round on `session.idle`, driven by the server half.
+
+Activation is process-local: a goal created or mutated while a process is alive
+is armed there, while a goal that only survived a restart (or was written by
+another process) stays disarmed until an explicit `/goal resume`. So a goal
+created outside a session starts with: open a session in that project, then
+`/goal resume`.
+
 While a goal is active, the model can use four tools:
 
 | Tool | Purpose |
@@ -126,7 +140,7 @@ TUI half (tui.js)                              Server half (index.js)
 ```bash
 bun install
 bun run typecheck   # tsc --noEmit
-bun test            # 57 unit/integration tests
+bun test            # 61 unit/integration tests
 bun run build       # bundles dist/index.js (server) and dist/tui.js (TUI)
 ```
 

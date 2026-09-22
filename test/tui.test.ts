@@ -10,6 +10,7 @@ import {
   type TuiGoalContext,
   type TuiKeymapCommandInput,
   type TuiKeymapLayerInput,
+  type TuiRouteRef,
 } from '../src/tui.tsx'
 import { GoalStore } from '../src/state.ts'
 
@@ -53,8 +54,11 @@ afterEach(() => {
 /**
  * The mock harness: a mock of the real TUI context plus everything the plugin
  * registers during setup, captured for the assertions below.
+ *
+ * `route` stands in for the TUI's current route: a `session` route carries the
+ * session that can execute a goal round, anything else leaves it without one.
  */
-function makeContext(directory: string) {
+function makeContext(directory: string, route: TuiRouteRef = { type: 'session', sessionID: 'ses-goal' }) {
   const toasts: Toast[] = []
   const prompts: Array<{ sessionID: string; text: string }> = []
   const slots: SlotClaim[] = []
@@ -100,7 +104,7 @@ function makeContext(directory: string) {
         alert: async () => {},
         clear: () => {},
       },
-      router: { current: () => ({ type: 'session', sessionID: 'ses-goal' }) },
+      router: { current: () => route },
       slot: claim => slots.push(claim),
     },
   }
@@ -109,11 +113,11 @@ function makeContext(directory: string) {
 }
 
 /** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
-function setup(): Mock {
+function setup(route?: TuiRouteRef): Mock {
   const directory = mkdtempSync(join(tmpdir(), 'goal-tui-'))
   cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
 
-  const harness = makeContext(directory)
+  const harness = makeContext(directory, route)
   const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 0 }).setup(harness.context)
   cleanups.push(cleanup)
 
@@ -182,6 +186,44 @@ describe('tui goal command plane', () => {
     harness.slots.find(claim => claim.append === 'app')?.render({})
     expect(harness.layers.length).toBe(1)
     expect(harness.layers[0].commands.map(command => command.id)).toContain('goal.command')
+  })
+
+  test('a goal created with no session open stays armed but idle, and says why', async () => {
+    const mock = setup({ type: 'home' })
+    await mock.command('goal.command').run!('work without a session')
+
+    const store = new GoalStore(mock.directory)
+    expect(store.current?.phase).toBe('active')
+    expect(store.current?.roundsStarted).toBe(0)
+    expect(mock.prompts.length).toBe(0)
+    expect(mock.toasts.some(toast => toast.message.includes('No session is open in this project'))).toBe(true)
+  })
+
+  test('the created goal starts once a session is open and resumed there', async () => {
+    // the TUI half that created the goal without a session
+    const created = setup({ type: 'home' })
+    await created.command('goal.command').run!('work started later')
+
+    // a session is now open: `/goal resume` admits and submits round 1
+    const resumed = setup()
+    resumed.context.location!.directory = created.directory
+    await resumed.command('goal.command').run!('resume')
+
+    expect(resumed.prompts.length).toBe(1)
+    expect(resumed.prompts[0].sessionID).toBe('ses-goal')
+    expect(resumed.prompts[0].text).toContain('round 1/25')
+    expect(new GoalStore(created.directory).current?.roundsStarted).toBe(1)
+  })
+
+  test('a paused goal is resumed and started by /goal resume', async () => {
+    const mock = setup()
+    await mock.command('goal.command').run!('pausable work')
+    await mock.command('goal.command').run!('pause')
+    mock.prompts.length = 0
+
+    await mock.command('goal.command').run!('resume')
+    expect(mock.prompts.length).toBe(1)
+    expect(mock.prompts[0].text).toContain('round 2/25')
   })
 
   test('the sidebar renders with no goal set and after a create', async () => {
