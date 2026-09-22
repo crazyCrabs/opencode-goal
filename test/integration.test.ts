@@ -106,8 +106,8 @@ function tuiHalf(directory: string) {
 /**
  * The server half: the opencode 2.x plugin definition runs its `setup` against
  * a mock plugin context, and everything it registers imperatively — the goal
- * tools, the system-prompt hook, and the `session.idle` continuation loop — is
- * captured for the assertions below.
+ * tools, the system-prompt hook, and the continuation loop — is captured for
+ * the assertions below.
  */
 async function serverHalf(directory: string) {
   const prompts: Array<{ sessionID: string; text: string }> = []
@@ -134,6 +134,8 @@ async function serverHalf(directory: string) {
       },
       // no assistant turn is reported for these sessions: nothing is attributed
       context: async () => [],
+      // session lookup for location-less turn events
+      get: async (input: { sessionID: string }) => ({ directory, parentID: undefined }),
     },
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => ({
@@ -159,11 +161,16 @@ async function serverHalf(directory: string) {
       await settle()
     },
     /** Emit one `session.created` event and wait for the driver to finish. */
-    created: async (sessionID: string): Promise<void> => {
+    created: async (sessionID: string, sessionDirectory?: string, parentID?: string): Promise<void> => {
+      const target = sessionDirectory ?? directory
       queue.push({
         type: 'session.created',
-        data: { sessionID, info: { id: sessionID, directory } },
-        location: { directory },
+        data: {
+          sessionID,
+          ...parentID === undefined ? {} : { parentID },
+          info: { id: sessionID, directory: target, ...parentID === undefined ? {} : { parentID } },
+        },
+        location: { directory: target },
       })
       await settle()
     },
@@ -174,6 +181,23 @@ async function serverHalf(directory: string) {
         data: [{ sessionID, info: { id: sessionID, directory } }],
         location: { directory },
       })
+      await settle()
+    },
+    /**
+     * Emit the turn-completion event opencode 2.x actually publishes —
+     * `session.execution.succeeded|failed|interrupted`, with no location —
+     * and wait for the driver to finish.
+     */
+    turnFinished: async (sessionID: string, outcome: 'succeeded' | 'failed' | 'interrupted' = 'succeeded', reason?: string): Promise<void> => {
+      queue.push({
+        type: `session.execution.${outcome}`,
+        data: reason === undefined ? { sessionID } : { sessionID, reason },
+      })
+      await settle()
+    },
+    /** Emit one `session.deleted` event and wait for the driver to finish. */
+    deleted: async (sessionID: string): Promise<void> => {
+      queue.push({ type: 'session.deleted', data: { sessionID }, location: { directory } })
       await settle()
     },
     /** Render the system prompt for one session through the registered hook. */
@@ -235,8 +259,11 @@ describe('TUI command plane + server driver', () => {
       expect(server.prompts[0].text).toContain('round 2/25')
       expect(server.prompts[0].text).toContain('integrate the halves')
 
-      // and it keeps going on the next idle without any further user action
+      // and it keeps going when that round's turn reports back, with no
+      // further user action; an idle arriving mid-round admits nothing
       await server.idle('ses-integration')
+      expect(server.prompts.length).toBe(1)
+      await server.turnFinished('ses-integration')
       expect(server.prompts.length).toBe(2)
       expect(server.prompts[1].text).toContain('round 3/25')
 
@@ -293,26 +320,100 @@ describe('TUI command plane + server driver', () => {
       expect(server.prompts[0].text).toContain('round 1/25')
       expect(server.prompts[0].text).toContain('yesterday objective')
 
-      // the loop continues on idle in that session, with no further action
+      // the loop continues when that round's turn reports back through
+      // session.execution.succeeded, with no further action — and an idle
+      // arriving mid-round cannot admit a second one
       await server.idle('ses-restart')
+      expect(server.prompts.length).toBe(1)
+      await server.turnFinished('ses-restart')
       expect(server.prompts.length).toBe(2)
       expect(server.prompts[1].text).toContain('round 2/25')
 
-      // a session opened after that round finished adopts the goal and carries on
+      // a session opened mid-round defers to the running one: no parallel round
       await server.created('ses-second')
-      expect(server.prompts.length).toBe(3)
-      expect(server.prompts[2].sessionID).toBe('ses-second')
-      expect(server.prompts[2].text).toContain('round 3/25')
+      expect(server.prompts.length).toBe(2)
 
-      // a list-shaped creation payload drives the same round
+      // the round finishes: round 3 runs, and a list-shaped creation payload
+      // for another session defers the same way
+      await server.turnFinished('ses-restart')
+      expect(server.prompts.length).toBe(3)
+      expect(server.prompts[2].text).toContain('round 3/25')
       await server.createdList('ses-third')
+      expect(server.prompts.length).toBe(3)
+
+      // the human interrupts round 3: no next round is admitted, and the next
+      // session to open adopts the goal and carries on from there
+      await server.turnFinished('ses-restart', 'interrupted', 'user')
+      expect(server.prompts.length).toBe(3)
+      await server.created('ses-fourth')
       expect(server.prompts.length).toBe(4)
-      expect(server.prompts[3].sessionID).toBe('ses-third')
+      expect(server.prompts[3].sessionID).toBe('ses-fourth')
       expect(server.prompts[3].text).toContain('round 4/25')
 
       await server.cleanup()
     } finally {
       rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('the autonomous loop advances round after round on turn completion', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-integration-loop-'))
+    try {
+      const server = await serverHalf(directory)
+      await server.tool('create_goal').execute({ objective: 'loop objective' })
+      await server.created('ses-loop')
+
+      // each finished turn admits exactly one more round, with no human input
+      expect(server.prompts.length).toBe(1)
+      for (const round of [1, 2, 3]) {
+        await server.turnFinished('ses-loop')
+        expect(server.prompts.length).toBe(round + 1)
+        expect(server.prompts[round].text).toContain(`round ${round + 1}/25`)
+      }
+
+      // a failed turn keeps the loop going; an interrupted-by-user turn does not
+      await server.turnFinished('ses-loop', 'failed')
+      expect(server.prompts.length).toBe(5)
+      await server.turnFinished('ses-loop', 'interrupted', 'user')
+      expect(server.prompts.length).toBe(5)
+      await server.turnFinished('ses-loop')
+      expect(server.prompts.length).toBe(6)
+
+      // a deleted session stops being driven
+      await server.deleted('ses-loop')
+      await server.turnFinished('ses-loop')
+      expect(server.prompts.length).toBe(6)
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('another project\'s session events do not drive this project\'s goal', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-integration-own-'))
+    const other = mkdtempSync(join(tmpdir(), 'goal-integration-other-'))
+    try {
+      const server = await serverHalf(directory)
+      await server.tool('create_goal').execute({ objective: 'owned objective' })
+
+      // a session created in another project: another plugin instance owns it,
+      // so its turns never admit rounds against this project's goal
+      await server.created('ses-foreign', other)
+      expect(server.prompts.length).toBe(0)
+      await server.turnFinished('ses-foreign')
+      expect(server.prompts.length).toBe(0)
+
+      // a subagent session (it carries a parentID) is never driven either
+      await server.created('ses-child', directory, 'ses-parent')
+      expect(server.prompts.length).toBe(0)
+      await server.turnFinished('ses-child')
+      expect(server.prompts.length).toBe(0)
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+      rmSync(other, { recursive: true, force: true })
     }
   })
 

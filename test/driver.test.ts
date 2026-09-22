@@ -12,9 +12,9 @@ const promptCalls: Array<{ sessionID: string; text: string }> = []
 
 /**
  * The slice of the opencode 2.x session domain the driver speaks to: a flat
- * `{ sessionID, text }` prompt and a transcript read. Usage and round output
- * are attributed from the transcript — opencode 2.x no longer emits
- * `message.updated` — so the mock carries one finished assistant turn.
+ * `{ sessionID, text }` prompt, a transcript read, and a session lookup. Usage
+ * and round output are attributed from the transcript — opencode 2.x no longer
+ * emits `message.updated` — so the mock carries one finished assistant turn.
  */
 const transcript = [
   {
@@ -33,6 +33,7 @@ const session = {
     return {}
   },
   context: async () => transcript,
+  get: async (input: { sessionID: string }) => ({ directory: dir, parentID: undefined }),
 }
 
 /** When set, a submitted round prompt parks until this releases it. */
@@ -73,17 +74,18 @@ describe('continuation driver', () => {
     const driver2 = makeDriver(capped)
     capped.create('tiny goal', 1, 0)
     await driver2.onSessionIdle('session-2', dir)
-    await driver2.onSessionIdle('session-2', dir)
+    await driver2.onTurnFinished('session-2', dir)
     expect(capped.current?.phase).toBe('blocked')
     expect(capped.current?.blockedReason?.code).toBe('round-limit')
   })
 
-  test('token budget blocks with budget-limited on the next idle', async () => {
+  test('token budget blocks with budget-limited on the next finished turn', async () => {
     const budgeted = new GoalStore(mkdtempSync(join(tmpdir(), 'goal-driver-budget-')))
     const driver3 = makeDriver(budgeted)
     budgeted.create('budget goal', 25, 10)
-    await driver3.onSessionIdle('session-3', dir) // the finished turn already spent 100 >= 10
-    await driver3.onSessionIdle('session-3', dir) // the guardrail has fired, nothing is admitted
+    await driver3.onSessionIdle('session-3', dir) // round 1 admitted
+    await driver3.onTurnFinished('session-3', dir) // the finished turn already spent 100 >= 10
+    await driver3.onTurnFinished('session-3', dir) // the guardrail has fired, nothing is admitted
     expect(budgeted.current?.phase).toBe('blocked')
     expect(budgeted.current?.blockedReason?.code).toBe('budget-limited')
   })
@@ -142,13 +144,64 @@ describe('a session opening adopts the goal', () => {
     expect(promptCalls[before].text).toContain('round 1/5')
     expect(today.current?.roundsStarted).toBe(1)
 
-    // and the loop continues on idle in that session, with no further action
-    await adopted.onSessionIdle('session-adopt', directory)
+    // and the loop continues when that round's turn reports back, with no
+    // further action: opencode 2.x signals a finished turn through
+    // session.execution.*, never through session.idle
+    await adopted.onTurnFinished('session-adopt', directory)
     expect(promptCalls.length).toBe(before + 2)
     expect(promptCalls[before + 1].text).toContain('round 2/5')
 
     // re-opening the same session does not admit another round
     await adopted.onSessionCreated('session-adopt', directory)
+    expect(promptCalls.length).toBe(before + 2)
+  })
+
+  test('a round in flight suppresses idle bursts and parallel rounds', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-inflight-'))
+    const store = new GoalStore(directory)
+    store.create('inflight objective', 5, 0)
+    const driver = makeDriver(store)
+    const before = promptCalls.length
+
+    // a session opens: round 1 is admitted and its prompt is submitted
+    await driver.onSessionCreated('session-inflight', directory)
+    expect(promptCalls.length).toBe(before + 1)
+    expect(store.current?.roundsStarted).toBe(1)
+
+    // a burst of idles while that round's turn runs admits nothing: opencode
+    // coalesces a prompt submitted mid-turn, so each extra admission would
+    // spend a round on a prompt that never executes
+    for (let i = 0; i < 3; i++) await driver.onSessionIdle('session-inflight', directory)
+    expect(promptCalls.length).toBe(before + 1)
+    expect(store.current?.roundsStarted).toBe(1)
+
+    // nor does a second session opening start a parallel round on the goal
+    await driver.onSessionCreated('session-second', directory)
+    expect(promptCalls.length).toBe(before + 1)
+
+    // the turn reports back: round 2 is admitted exactly once
+    await driver.onTurnFinished('session-inflight', directory)
+    expect(promptCalls.length).toBe(before + 2)
+    expect(store.current?.roundsStarted).toBe(2)
+  })
+
+  test('a user interrupt is accounted but not continued', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-interrupt-'))
+    const store = new GoalStore(directory)
+    store.create('interrupt objective', 5, 0)
+    const driver = makeDriver(store)
+    const before = promptCalls.length
+
+    await driver.onSessionCreated('session-interrupt', directory)
+    expect(promptCalls.length).toBe(before + 1)
+
+    // the human pressed escape: the round is accounted, no next round starts
+    await driver.onTurnFinished('session-interrupt', directory, 'user')
+    expect(promptCalls.length).toBe(before + 1)
+    expect(store.view()?.usage.inputTokens).toBe(100)
+
+    // a later non-user completion continues the loop again
+    await driver.onTurnFinished('session-interrupt', directory)
     expect(promptCalls.length).toBe(before + 2)
   })
 

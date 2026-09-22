@@ -68,7 +68,7 @@ has the next round admitted and submitted to it automatically, with no manual
 1. The first round right after `/goal create|edit|resume`, when the TUI's
    current route is a session. Created from the home route (no session open),
    the goal is armed but idle and the command says so.
-2. Every further round on `session.idle`, driven by the server half.
+2. Every further round after a turn finishes, driven by the server half.
 
 `/goal resume` therefore only matters for goals a human deliberately stopped:
 `pause`, a `blocked` goal, or one sitting in `goal_wait` until its deadline.
@@ -101,7 +101,8 @@ TUI half (tui.js)                              Server half (index.js)
 /goal --> parse --> GoalStore --> toast / dialog / sidebar
                         |                            |
                         |                            +--> goal tools (get / create / update / wait)
-                        |                            +--> GoalDriver on session.created (adopt) + session.idle (continue)
+                        |                            +--> GoalDriver on session.created (adopt)
+                        |                            |           + session.execution.* (continue)
                         v                                 |
               .opencode/goal-log.jsonl <------------------+   (re-folded on every read)
 ```
@@ -110,16 +111,26 @@ TUI half (tui.js)                              Server half (index.js)
   its output stays in the UI. No prompt parts are injected, so goal control never
   costs a model turn. After a create/edit/resume the command plane also admits
   and submits the first working round, because a locally executed slash command
-  produces no `session.idle` that would otherwise wake the driver.
+  produces no turn-completion event that would otherwise wake the driver.
 - **Keymap layers are render-tree hooks**: `context.keymap.layer` is
   `Keymap.createLayer`, which reads `Keymap.Provider` off the Solid context chain.
   Plugin setup is activated from a promise continuation, outside that chain, so
   the layer is claimed from a `ui.slot({ append: 'app' })` render — the same
   posture as the built-in plugins. Claiming it from setup throws
   `Keymap.Provider is missing`; the layer is disposed when that slot unmounts.
-- **Continuation**: on `session.idle`, if the goal is `active` + `armed`, one
-  guarded round is admitted (CAS) and a synthetic continuation prompt is injected.
-  Provider errors disarm instead of looping.
+- **Continuation**: opencode 2.x reports a finished turn through
+  `session.execution.succeeded|failed|interrupted` and never publishes
+  `session.idle` for one, so those execution events are the driver's completion
+  signal: the turn is accounted (usage + round output) and, if the goal is
+  `active` + `armed`, one guarded round is admitted (CAS) and a synthetic
+  continuation prompt is injected. `session.idle` is still honored as a legacy
+  trigger while no round is in flight. A turn the human interrupted
+  (`reason: "user"`) is accounted but not continued; provider errors on
+  submission disarm instead of looping.
+- **One round at a time per session**: a round is in flight from admission until
+  its turn's completion event. opencode coalesces a prompt submitted mid-turn
+  instead of running it, so a second admission meanwhile would spend budget on a
+  prompt that never executes — the in-flight guard drops those triggers.
 - **Event sourcing**: every mutation (`create` / `edit` / `pause` / `resume` /
   `complete` / `block` / `continue` / `wait` / `clear`) appends a full-snapshot
   `goal/change` event to `<project>/.opencode/goal-log.jsonl`. The current state
@@ -127,6 +138,8 @@ TUI half (tui.js)                              Server half (index.js)
 - **CAS refs**: tools must pass the exact `goal_id` + `revision`; stale refs are
   rejected (`GOAL_STALE_REVISION`), preventing delayed turns from mutating a
   newer goal instance.
+  The driver also tolerates losing a CAS race (a second plugin instance for the
+  same project observed the same event) by stepping aside instead of throwing.
 - **Orthogonal state**: durable `phase` (`active` / `paused` / `blocked` /
   `complete`) is separate from process-local `activation` (`armed` / `disarmed`).
   A store arms a goal newer than the ref it was born with, so a goal created or
@@ -139,6 +152,11 @@ TUI half (tui.js)                              Server half (index.js)
   session — the same CAS path as a resume. One round per project at a time: a
   session opening while another is mid-round defers to it, and a finished round
   releases the project for the next session to adopt.
+- **Project ownership**: a server loads this plugin once per location, and every
+  instance sees every project's events, so each event is attributed to its
+  session's directory (from `session.created`, else `session.get`) and driven
+  only when that directory belongs to this instance's root. Subagent sessions
+  (they carry a `parentID`) and deleted sessions are never driven.
 
 ## Guardrails
 
@@ -155,7 +173,7 @@ TUI half (tui.js)                              Server half (index.js)
 ```bash
 bun install
 bun run typecheck   # tsc --noEmit
-bun test            # 68 unit/integration tests
+bun test            # 72 unit/integration tests
 bun run build       # bundles dist/index.js (server) and dist/tui.js (TUI)
 ```
 

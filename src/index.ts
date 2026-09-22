@@ -10,9 +10,19 @@
  * (`tui.tsx`) and executes directly in the UI without a server round trip; both
  * halves converge on `<worktree>/.opencode/goal-log.jsonl`.
  *
- * The driver runs on two events: `session.created` adopts an active goal into
- * the newly opened session (the human's go-ahead, replacing a manual resume),
- * and `session.idle` admits the next round after each finished turn.
+ * The driver runs on three events: `session.execution.succeeded|failed|
+ * interrupted` continues the goal after each finished turn — opencode 2.x
+ * publishes no `session.idle` when a turn ends, so the execution events are
+ * the only reliable completion signal — `session.created` adopts an active
+ * goal into the newly opened session (the human's go-ahead, replacing a manual
+ * resume), and `session.deleted` forgets the session. The legacy
+ * `session.idle` is still honored while no round is in flight.
+ *
+ * Events carry no project directory on the execution family, and a server
+ * loads this plugin once per location, so every instance sees every project's
+ * events: each event is therefore resolved to its session's directory (from
+ * the `session.created` payload, else `session.get`) and driven only when that
+ * directory belongs to this instance's root.
  *
  * opencode 2.x loads this as a plugin definition — an object with an `id` and a
  * `setup` function that receives the plugin context. Everything is registered
@@ -49,6 +59,67 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
 
     const log = (message: string, extra?: Record<string, unknown>): void => {
       console.log(`[opencode-goal] ${message}`, extra ?? '')
+    }
+
+    /**
+     * Session directory per session ID, learned from `session.created`: the
+     * execution events carry no location, and the session's directory decides
+     * which project's goal (and plugin instance) owns its turns.
+     */
+    const sessionDirectories = new Map<string, string>()
+    /** Subagent/child sessions (they carry a parentID) never run goal rounds. */
+    const childSessions = new Set<string>()
+
+    /** Normalize a path for comparison: Windows accepts both separators. */
+    const normalizePath = (value: string): string => value.replace(/\//g, '\\').toLowerCase()
+
+    /** Whether one directory belongs to this plugin instance's project root. */
+    const ownsDirectory = (directory: string): boolean => {
+      const rootPath = normalizePath(root)
+      const dir = normalizePath(directory)
+      return dir === rootPath || dir.startsWith(`${rootPath}\\`)
+    }
+
+    /**
+     * Remember one session's project directory and whether it is a subagent
+     * session, so later location-less events can be attributed correctly.
+     */
+    const rememberSession = (sessionID: string, directory: string | undefined, parentID: unknown): void => {
+      if (directory !== undefined && directory.length > 0) sessionDirectories.set(sessionID, directory)
+      if (typeof parentID === 'string' && parentID.length > 0) childSessions.add(sessionID)
+    }
+
+    /**
+     * Resolve the directory a session's turn belongs to, or undefined when it
+     * belongs to another project (another plugin instance drives it there) or
+     * is a subagent session. Falls back to a session lookup for sessions this
+     * process never saw created — a session reopened after a restart.
+     */
+    const resolveTurnSession = async (
+      sessionID: string,
+      envelopeDirectory: string | undefined,
+    ): Promise<string | undefined> => {
+      if (childSessions.has(sessionID)) return undefined
+      let directory = sessionDirectories.get(sessionID)
+      if (directory === undefined) {
+        try {
+          // the plugin's session.get returns the session info; the directory
+          // has been seen both at the top level and under `location`
+          const info = (await ctx.session.get({ sessionID })) as
+            | { directory?: string; parentID?: string; location?: { directory?: string } }
+            | undefined
+          if (info === undefined) return undefined
+          const infoDirectory = info.directory ?? info.location?.directory
+          rememberSession(sessionID, infoDirectory, info.parentID)
+          if (childSessions.has(sessionID)) return undefined
+          directory = infoDirectory
+        } catch {
+          return undefined // a failed lookup is retried on the next event
+        }
+      }
+      if (directory === undefined || directory.length === 0) directory = envelopeDirectory
+      if (directory === undefined || !ownsDirectory(directory)) return undefined
+      return directory
     }
 
     const driver = new GoalDriver({
@@ -90,7 +161,7 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
       })
     })
 
-    // Continuation driver: one guarded round per `session.idle` while the goal
+    // Continuation driver: one guarded round per finished turn while the goal
     // is active and armed — and one first round when a session is created,
     // because opening a session is the human's go-ahead to run the goal. The
     // event stream ends when the server shuts down.
@@ -99,16 +170,48 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           if (event.type === 'session.idle') {
-            void driver.onSessionIdle(event.data.sessionID, event.location?.directory ?? root)
+            // legacy completion signal: honored only while no round is in
+            // flight, because 2.x can emit it without any turn finishing
+            const sessionID = event.data.sessionID
+            if (sessionID === undefined) continue
+            void (async () => {
+              const directory = await resolveTurnSession(sessionID, event.location?.directory)
+              if (directory !== undefined) await driver.onSessionIdle(sessionID, directory)
+            })()
           } else if (event.type === 'session.created') {
             // opencode reports one creation per entry; `data` has been seen both
             // as a single payload and as a list, so normalize before driving
             const entries = Array.isArray(event.data) ? event.data : [event.data]
             for (const entry of entries) {
               const sessionID = entry.sessionID ?? entry.info?.id
-              const directory = entry.info?.directory ?? event.location?.directory ?? root
-              if (sessionID !== undefined) void driver.onSessionCreated(sessionID, directory)
+              if (sessionID === undefined) continue
+              const parentID = entry.parentID ?? entry.info?.parentID
+              const directory = entry.location?.directory ?? entry.info?.directory ?? event.location?.directory ?? root
+              rememberSession(sessionID, directory, parentID)
+              if (childSessions.has(sessionID)) continue // a subagent session never runs goal rounds
+              if (!ownsDirectory(directory)) continue // another instance owns that project
+              void driver.onSessionCreated(sessionID, directory)
             }
+          } else if (
+            event.type === 'session.execution.succeeded' ||
+            event.type === 'session.execution.failed' ||
+            event.type === 'session.execution.interrupted'
+          ) {
+            // the only reliable turn-completion signal in opencode 2.x: this is
+            // what keeps the autonomous loop advancing round after round
+            const sessionID = event.data.sessionID
+            if (sessionID === undefined) continue
+            const reason = event.type === 'session.execution.interrupted' ? event.data.reason : undefined
+            void (async () => {
+              const directory = await resolveTurnSession(sessionID, event.location?.directory)
+              if (directory !== undefined) await driver.onTurnFinished(sessionID, directory, reason)
+            })()
+          } else if (event.type === 'session.deleted') {
+            const sessionID = event.data.sessionID
+            if (sessionID === undefined) continue
+            sessionDirectories.delete(sessionID)
+            childSessions.delete(sessionID)
+            driver.forget(sessionID)
           }
         }
       } catch {
