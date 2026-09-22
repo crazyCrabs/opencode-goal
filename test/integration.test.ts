@@ -64,6 +64,7 @@ function tuiHalf(directory: string) {
   const prompts: Array<{ sessionID: string; text: string }> = []
   const toasts: Array<{ variant?: string; message: string }> = []
   const layers: TuiKeymapLayerInput[] = []
+  const slots: Array<{ append: string; render: () => unknown }> = []
   const context = {
     location: { directory },
     client: {
@@ -89,11 +90,15 @@ function tuiHalf(directory: string) {
         clear: () => {},
       },
       router: { current: () => ({ type: 'session', sessionID: 'ses-integration' }) },
-      slot: () => {},
+      slot: (claim: { append: string; render: () => unknown }) => {
+        slots.push(claim)
+      },
     },
   } as unknown as TuiGoalContext
   const plugin = createGoalTuiPlugin({ refreshIntervalMs: 0 })
   const cleanup = plugin.setup(context)
+  // the keymap layer registers from the TUI render tree, not from setup
+  slots.find(claim => claim.append === 'app')?.render()
   const command = layers[0]?.commands.find((entry: TuiKeymapCommandInput) => entry.id === 'goal.command')
   return { prompts, toasts, cleanup, command: command! }
 }

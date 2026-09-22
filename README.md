@@ -17,21 +17,16 @@ The plugin ships as two bundles because opencode loads server plugins and TUI
 plugins through separate paths. Both are needed: the server half owns the goal
 state, tools, and continuation driver; the TUI half owns the `/goal` command.
 
-Drop both bundled files into your global config (or your project's
-`.opencode/plugins/`):
+Drop the bundled files into a plugin directory in your global config (or your
+project's `.opencode/plugins/`):
 
 ```
-~/.config/opencode/plugins/opencode-goal.js     # dist/index.js — server half
-~/.config/opencode/plugins/opencode-goal-tui.js # dist/tui.js    — TUI half
+~/.config/opencode/plugins/opencode-goal/index.js # dist/index.js — server half
+~/.config/opencode/plugins/opencode-goal/tui.js   # dist/tui.js    — TUI half
 ```
 
-Then register the TUI half in `~/.config/opencode/tui.json`:
-
-```json
-{
-  "plugin": ["./plugins/opencode-goal-tui.js"]
-}
-```
+A plugin directory is auto-discovered: the server half resolves to `index` and
+the TUI half to `tui`, so no `tui.json` registration is needed.
 
 The TUI bundle keeps `solid-js` and `@opentui/*` external, so those packages
 must resolve from the config directory (opencode installs them itself; verify
@@ -45,7 +40,7 @@ Or as an npm package (once published) for the server half:
 
 The `/goal` slash command is registered by the TUI plugin itself: it parses the
 input, executes it against the goal log, and shows the result as a toast or
-dialog. No command file and no model turn are involved.
+dialog. No command file and no model turn is involved.
 
 ## Usage
 
@@ -93,6 +88,12 @@ TUI half (tui.js)                              Server half (index.js)
   costs a model turn. After a create/edit/resume the command plane also admits
   and submits the first working round, because a locally executed slash command
   produces no `session.idle` that would otherwise wake the driver.
+- **Keymap layers are render-tree hooks**: `context.keymap.layer` is
+  `Keymap.createLayer`, which reads `Keymap.Provider` off the Solid context chain.
+  Plugin setup is activated from a promise continuation, outside that chain, so
+  the layer is claimed from a `ui.slot({ append: 'app' })` render — the same
+  posture as the built-in plugins. Claiming it from setup throws
+  `Keymap.Provider is missing`; the layer is disposed when that slot unmounts.
 - **Continuation**: on `session.idle`, if the goal is `active` + `armed`, one
   guarded round is admitted (CAS) and a synthetic continuation prompt is injected.
   Provider errors disarm instead of looping.
@@ -125,7 +126,7 @@ TUI half (tui.js)                              Server half (index.js)
 ```bash
 bun install
 bun run typecheck   # tsc --noEmit
-bun test            # 55 unit/integration tests
+bun test            # 57 unit/integration tests
 bun run build       # bundles dist/index.js (server) and dist/tui.js (TUI)
 ```
 

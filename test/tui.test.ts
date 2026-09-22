@@ -17,15 +17,24 @@ interface Toast {
   duration?: number
 }
 
+interface SlotClaim {
+  append: string
+  render: (input: { sessionID?: string }) => unknown
+}
+
 interface Mock {
   directory: string
   context: TuiGoalContext
   toasts: Toast[]
   prompts: Array<{ sessionID: string; text: string }>
-  slots: Array<{ append: string; render: (input: { sessionID?: string }) => unknown }>
+  slots: SlotClaim[]
   confirms: Array<{ title: string; message: string }>
   objectivePrompts: Array<{ title: string }>
   state: { confirmResult: boolean; promptResult: string | undefined; status: string }
+  layers: TuiKeymapLayerInput[]
+  /** Mount the `app` slot claim the way the TUI renders it, inside its render tree. */
+  mountKeymapLayer(): void
+  slot(append: string): SlotClaim | undefined
   command(id: string): TuiKeymapCommandInput
   unsubscribed(): boolean
 }
@@ -39,18 +48,18 @@ afterEach(() => {
   }
 })
 
-/** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
-function setup(): Mock {
-  const directory = mkdtempSync(join(tmpdir(), 'goal-tui-'))
-  cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
-
+/**
+ * The mock harness: a mock of the real TUI context plus everything the plugin
+ * registers during setup, captured for the assertions below.
+ */
+function makeContext(directory: string) {
   const toasts: Toast[] = []
   const prompts: Array<{ sessionID: string; text: string }> = []
-  const slots: Mock['slots'] = []
+  const slots: SlotClaim[] = []
   const confirms: Mock['confirms'] = []
   const objectivePrompts: Mock['objectivePrompts'] = []
-  const state = { confirmResult: true, promptResult: 'objective from the dialog' as string | undefined, status: 'idle' }
   const layers: TuiKeymapLayerInput[] = []
+  const state = { confirmResult: true, promptResult: 'objective from the dialog' as string | undefined, status: 'idle' }
   let unsubscribed = false
 
   const context: TuiGoalContext = {
@@ -94,25 +103,59 @@ function setup(): Mock {
     },
   }
 
-  const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 0 }).setup(context)
+  return { context, toasts, prompts, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
+}
+
+/** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
+function setup(): Mock {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-tui-'))
+  cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
+
+  const harness = makeContext(directory)
+  const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 0 }).setup(harness.context)
   cleanups.push(cleanup)
-  const commands = layers[0]?.commands ?? []
+
+  const mountKeymapLayer = (): void => {
+    harness.slots.find(claim => claim.append === 'app')?.render({})
+  }
+  mountKeymapLayer()
+  const commands = harness.layers[0]?.commands ?? []
 
   return {
     directory,
-    context,
-    toasts,
-    prompts,
-    slots,
-    confirms,
-    objectivePrompts,
-    state,
+    context: harness.context,
+    toasts: harness.toasts,
+    prompts: harness.prompts,
+    slots: harness.slots,
+    confirms: harness.confirms,
+    objectivePrompts: harness.objectivePrompts,
+    state: harness.state,
+    layers: harness.layers,
+    mountKeymapLayer,
+    slot: append => harness.slots.find(claim => claim.append === append),
     command: id => commands.find(command => command.id === id)!,
-    unsubscribed: () => unsubscribed,
+    unsubscribed: harness.unsubscribed,
   }
 }
 
 describe('tui goal command plane', () => {
+  test('registers the keymap layer from the TUI render tree, never from setup', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-tui-'))
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
+
+    const harness = makeContext(directory)
+    // setup runs where the TUI activates plugins: outside Keymap.Provider, so
+    // calling the keymap hook here throws `Keymap.Provider is missing`
+    createGoalTuiPlugin({ refreshIntervalMs: 0 }).setup(harness.context)
+    expect(harness.layers.length).toBe(0)
+
+    // the layer is claimed from a slot render, which the TUI mounts inside its
+    // render tree (the same pattern the built-in plugins use)
+    harness.slots.find(claim => claim.append === 'app')?.render({})
+    expect(harness.layers.length).toBe(1)
+    expect(harness.layers[0].commands.map(command => command.id)).toContain('goal.command')
+  })
+
   test('registers the /goal slash command, palette entries, and the sidebar slot', () => {
     const mock = setup()
     const command = mock.command('goal.command')
@@ -122,7 +165,7 @@ describe('tui goal command plane', () => {
     expect(mock.command('goal.pause')).toBeDefined()
     expect(mock.command('goal.resume')).toBeDefined()
     expect(mock.command('goal.clear')).toBeDefined()
-    expect(mock.slots[0]?.append).toBe('sidebar.content')
+    expect(mock.slot('sidebar.content')?.append).toBe('sidebar.content')
   })
 
   test('status renders a direct toast and spends no model turn', async () => {
@@ -254,9 +297,9 @@ describe('tui goal command plane', () => {
     await mock.command('goal.command').run!('sidebar objective')
     mock.prompts.length = 0
 
-    const claim = mock.slots[0]
-    expect(claim.append).toBe('sidebar.content')
-    expect(typeof claim.render).toBe('function')
+    const claim = mock.slot('sidebar.content')
+    expect(claim?.append).toBe('sidebar.content')
+    expect(typeof claim?.render).toBe('function')
 
     const goal = new GoalStore(mock.directory).view()
     expect(goalSidebarSummary(goal).headline).toBe('active · sidebar objective')

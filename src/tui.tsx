@@ -56,7 +56,15 @@ export interface TuiKeymapLayerInput {
 }
 
 export interface TuiKeymapApi {
-  /** Registers a layer owned by the calling component; it is disposed with it. */
+  /**
+   * Registers a layer owned by the calling component; it is disposed with it.
+   *
+   * This is a hook over the TUI's `Keymap.Provider`: the provider is on the
+   * Solid context chain of the render tree, never of plugin setup (the TUI
+   * activates plugins from a promise continuation). Call it from inside a TUI
+   * render — a `ui.slot` render, exactly like the built-in plugins do — or it
+   * throws `Keymap.Provider is missing`.
+   */
   layer(input: () => TuiKeymapLayerInput): void
 }
 
@@ -315,8 +323,8 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           if (shouldKickRound(command, before, after)) await kickRound(store)
         }
 
-        // the layer is owned by this root and disposed with it
-        context.keymap.layer(() => ({
+        /** The `/goal` command plane: one global keymap layer. */
+        const layer = (): TuiKeymapLayerInput => ({
           mode: 'global',
           commands: [
             {
@@ -362,7 +370,20 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
             },
           ],
           bindings: [],
-        }))
+        })
+
+        // `keymap.layer` resolves `Keymap.Provider` from the render tree that
+        // calls it, and plugin setup never runs inside that tree — claiming the
+        // layer from setup throws `Keymap.Provider is missing`. The layer is
+        // therefore registered from a slot render (the built-in plugins use the
+        // same `ui.slot({ append: 'app' })` posture), which mounts it inside the
+        // TUI tree and disposes it when that slot unmounts.
+        context.ui.slot?.({
+          append: 'app',
+          render: () => {
+            context.keymap.layer(layer)
+          },
+        })
 
         // sidebar status view, refreshed on a poll plus TUI data events
         const [tick, setTick] = createSignal(0)
