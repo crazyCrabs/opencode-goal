@@ -5,10 +5,14 @@
  * phase/activation, round budget) with the pi-goal guardrails (token budgets,
  * no-progress detection, external waits, stale-turn guards).
  *
- * This is the server half: model-facing goal tools plus the `session.idle`
- * continuation driver. The human `/goal` slash command lives in the TUI half
+ * This is the server half: model-facing goal tools plus the continuation
+ * driver. The human `/goal` slash command lives in the TUI half
  * (`tui.tsx`) and executes directly in the UI without a server round trip; both
  * halves converge on `<worktree>/.opencode/goal-log.jsonl`.
+ *
+ * The driver runs on two events: `session.created` adopts an active goal into
+ * the newly opened session (the human's go-ahead, replacing a manual resume),
+ * and `session.idle` admits the next round after each finished turn.
  *
  * opencode 2.x loads this as a plugin definition — an object with an `id` and a
  * `setup` function that receives the plugin context. Everything is registered
@@ -87,13 +91,25 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     })
 
     // Continuation driver: one guarded round per `session.idle` while the goal
-    // is active and armed. The event stream ends when the server shuts down.
+    // is active and armed — and one first round when a session is created,
+    // because opening a session is the human's go-ahead to run the goal. The
+    // event stream ends when the server shuts down.
     const controller = new AbortController()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (event.type !== 'session.idle') continue
-          void driver.onSessionIdle(event.data.sessionID, event.location?.directory ?? root)
+          if (event.type === 'session.idle') {
+            void driver.onSessionIdle(event.data.sessionID, event.location?.directory ?? root)
+          } else if (event.type === 'session.created') {
+            // opencode reports one creation per entry; `data` has been seen both
+            // as a single payload and as a list, so normalize before driving
+            const entries = Array.isArray(event.data) ? event.data : [event.data]
+            for (const entry of entries) {
+              const sessionID = entry.sessionID ?? entry.info?.id
+              const directory = entry.info?.directory ?? event.location?.directory ?? root
+              if (sessionID !== undefined) void driver.onSessionCreated(sessionID, directory)
+            }
+          }
         }
       } catch {
         // the server closed the stream

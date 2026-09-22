@@ -51,7 +51,7 @@ dialog. No command file and no model turn is involved.
 /goal --rounds 10 <objective>           start with a round cap
 /goal edit <objective>                  update the objective without resetting counters
 /goal pause                             stop autonomous continuation, keep the goal
-/goal resume                            re-arm a paused/blocked goal
+/goal resume                            re-arm a paused/blocked goal and start its next round now
 /goal clear                             remove the goal (durable tombstone)
 ```
 
@@ -60,18 +60,20 @@ actions are available in the command palette (`Goal: …` group) and in the
 sidebar row, which shows the phase, objective, and round/budget progress.
 
 A goal only runs inside an opencode **session in that project** — it is not a
-background daemon. Two things start a round:
+background daemon. Opening a session is the go-ahead: any session created while
+a goal is active — including one opened in a brand-new TUI or after a restart —
+has the next round admitted and submitted to it automatically, with no manual
+`/goal resume`. Besides that, two more things start a round:
 
 1. The first round right after `/goal create|edit|resume`, when the TUI's
    current route is a session. Created from the home route (no session open),
    the goal is armed but idle and the command says so.
 2. Every further round on `session.idle`, driven by the server half.
 
-Activation is process-local: a goal created or mutated while a process is alive
-is armed there, while a goal that only survived a restart (or was written by
-another process) stays disarmed until an explicit `/goal resume`. So a goal
-created outside a session starts with: open a session in that project, then
-`/goal resume`.
+`/goal resume` therefore only matters for goals a human deliberately stopped:
+`pause`, a `blocked` goal, or one sitting in `goal_wait` until its deadline.
+A goal that is merely mid-round in another session is left to finish; a new
+session adopts it after the round completes.
 
 While a goal is active, the model can use four tools:
 
@@ -99,7 +101,7 @@ TUI half (tui.js)                              Server half (index.js)
 /goal --> parse --> GoalStore --> toast / dialog / sidebar
                         |                            |
                         |                            +--> goal tools (get / create / update / wait)
-                        |                            +--> GoalDriver on session.idle
+                        |                            +--> GoalDriver on session.created (adopt) + session.idle (continue)
                         v                                 |
               .opencode/goal-log.jsonl <------------------+   (re-folded on every read)
 ```
@@ -129,8 +131,14 @@ TUI half (tui.js)                              Server half (index.js)
   `complete`) is separate from process-local `activation` (`armed` / `disarmed`).
   A store arms a goal newer than the ref it was born with, so a goal created or
   resumed while the process is alive continues here — including a goal created
-  from the TUI — while a goal that only survived a restart stays quiet until a
-  human resumes it (the DSH posture).
+  from the TUI. A goal that only survived a restart is armed by the next
+  `session.created` instead, so it needs no manual resume; it only stays quiet
+  for phases a human chose to stop (`paused`, `blocked`, waiting).
+- **Session adoption**: `session.created` is the human's go-ahead. The driver
+  arms the goal, runs `goalBlockReason`, and admits the next round into that
+  session — the same CAS path as a resume. One round per project at a time: a
+  session opening while another is mid-round defers to it, and a finished round
+  releases the project for the next session to adopt.
 
 ## Guardrails
 
@@ -147,7 +155,7 @@ TUI half (tui.js)                              Server half (index.js)
 ```bash
 bun install
 bun run typecheck   # tsc --noEmit
-bun test            # 64 unit/integration tests
+bun test            # 68 unit/integration tests
 bun run build       # bundles dist/index.js (server) and dist/tui.js (TUI)
 ```
 

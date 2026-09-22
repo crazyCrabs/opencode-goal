@@ -80,7 +80,7 @@ describe('goal command execution', () => {
     const outcome = executeGoalCommand(observer, parseGoalCommand('status'))
     expect(outcome.ok).toBe(true)
     expect(outcome.text).toContain('Status: active (activation: disarmed)')
-    expect(outcome.text).toContain('Next step: /goal resume starts round 1.')
+    expect(outcome.text).toContain('Next step: /goal resume admits round 1, or open a session and it starts by itself.')
   })
 
   test('pause and resume round-trip through the command', () => {

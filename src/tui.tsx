@@ -112,12 +112,13 @@ const STATUS_TOAST_MS = 8000
 /** Toast lifetime for short mutation confirmations. */
 const ACTION_TOAST_MS = 5000
 /**
- * Why an armed goal stays quiet with no session open: the driver and the
- * first-round kick both need a session to run in, and a goal created from the
- * home route is armed but has nowhere to execute yet.
+ * Why an armed goal stays quiet with no session open: the first-round kick
+ * needs a session to run in, and a goal created from the home route has
+ * nowhere to execute yet. Opening a session adopts it — the server driver
+ * admits the next round on `session.created` — so no manual resume is needed.
  */
 const NO_SESSION_HINT =
-  'No session is open in this project, so the goal is armed but idle. Open a session here, then run /goal resume to start it.'
+  'No session is open in this project, so the goal has nothing to run in yet. Open a session here and it starts on its own — no /goal resume needed.'
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)

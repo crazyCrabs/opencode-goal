@@ -29,10 +29,14 @@ const transcript = [
 const session = {
   prompt: async (input: { sessionID: string; text: string }) => {
     promptCalls.push({ sessionID: input.sessionID, text: input.text })
+    if (releasePrompt !== undefined) await new Promise<void>(resolve => { releasePrompt = resolve })
     return {}
   },
   context: async () => transcript,
 }
+
+/** When set, a submitted round prompt parks until this releases it. */
+let releasePrompt: (() => void) | undefined
 
 function makeDriver(st: GoalStore): GoalDriver {
   const d = new GoalDriver({
@@ -109,6 +113,90 @@ describe('continuation driver', () => {
     waiting.waitUntil = Date.now() - 1000
     await driver5.onSessionIdle('session-5', dir)
     expect(promptCalls.length).toBe(before + 1)
+  })
+})
+
+describe('a session opening adopts the goal', () => {
+  test('a goal that only survived a restart starts when a session opens', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-adopt-'))
+    // yesterday: a goal was created and left active
+    const previous = new GoalStore(directory)
+    previous.create('survivor objective', 5, 0)
+
+    // today: a fresh store sees the goal as pre-existing, so it is disarmed —
+    // the exact posture that used to require a manual /goal resume
+    const today = new GoalStore(directory)
+    expect(today.view()?.activation).toBe('disarmed')
+    const adopted = makeDriver(today)
+
+    // an idle with no session activity stays quiet
+    const before = promptCalls.length
+    await adopted.onSessionIdle('session-adopt', directory)
+    expect(promptCalls.length).toBe(before)
+
+    // the user opens a session: the goal is adopted and round 1 runs there
+    await adopted.onSessionCreated('session-adopt', directory)
+    expect(promptCalls.length).toBe(before + 1)
+    expect(promptCalls[before].sessionID).toBe('session-adopt')
+    expect(promptCalls[before].text).toContain('survivor objective')
+    expect(promptCalls[before].text).toContain('round 1/5')
+    expect(today.current?.roundsStarted).toBe(1)
+
+    // and the loop continues on idle in that session, with no further action
+    await adopted.onSessionIdle('session-adopt', directory)
+    expect(promptCalls.length).toBe(before + 2)
+    expect(promptCalls[before + 1].text).toContain('round 2/5')
+
+    // re-opening the same session does not admit another round
+    await adopted.onSessionCreated('session-adopt', directory)
+    expect(promptCalls.length).toBe(before + 2)
+  })
+
+  test('a second session opening mid-round defers to the running one', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-racing-'))
+    const racing = new GoalStore(directory)
+    racing.create('racing objective', 5, 0)
+    const racingDriver = makeDriver(racing)
+
+    let release = (): void => {}
+    releasePrompt = () => release()
+    try {
+      const before = promptCalls.length
+      // session A opens: its round is admitted and parked inside `prompt`
+      await racingDriver.onSessionCreated('session-a', directory)
+      expect(promptCalls.length).toBe(before + 1)
+
+      // session B opens while A's round is still running: no parallel round
+      await racingDriver.onSessionCreated('session-b', directory)
+      expect(promptCalls.length).toBe(before + 1)
+      expect(racing.current?.roundsStarted).toBe(1)
+    } finally {
+      release()
+      releasePrompt = undefined
+    }
+  })
+
+  test('paused, blocked and waiting goals are not auto-started', async () => {
+    const before = promptCalls.length
+
+    const pausedDir = mkdtempSync(join(tmpdir(), 'goal-driver-paused-adopt-'))
+    const paused = new GoalStore(pausedDir)
+    paused.create('paused objective', 25, 0)
+    paused.pause({ id: paused.current!.id, revision: paused.current!.revision })
+    await makeDriver(paused).onSessionCreated('session-paused', pausedDir)
+    expect(promptCalls.length).toBe(before)
+
+    const waitingDir = mkdtempSync(join(tmpdir(), 'goal-driver-wait-adopt-'))
+    const waiting = new GoalStore(waitingDir)
+    waiting.create('waiting objective', 25, 0)
+    waiting.wait({ id: waiting.current!.id, revision: waiting.current!.revision }, 'waiting for review', 60_000)
+    await makeDriver(waiting).onSessionCreated('session-waiting', waitingDir)
+    expect(promptCalls.length).toBe(before)
+
+    const emptyDir = mkdtempSync(join(tmpdir(), 'goal-driver-empty-'))
+    const empty = new GoalStore(emptyDir)
+    await makeDriver(empty).onSessionCreated('session-empty', emptyDir)
+    expect(promptCalls.length).toBe(before)
   })
 })
 

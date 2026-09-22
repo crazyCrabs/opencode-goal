@@ -158,6 +158,24 @@ async function serverHalf(directory: string) {
       queue.push({ type: 'session.idle', data: { sessionID }, location: { directory } })
       await settle()
     },
+    /** Emit one `session.created` event and wait for the driver to finish. */
+    created: async (sessionID: string): Promise<void> => {
+      queue.push({
+        type: 'session.created',
+        data: { sessionID, info: { id: sessionID, directory } },
+        location: { directory },
+      })
+      await settle()
+    },
+    /** Emit one `session.created` event reported as a list, as the schema types it. */
+    createdList: async (sessionID: string): Promise<void> => {
+      queue.push({
+        type: 'session.created',
+        data: [{ sessionID, info: { id: sessionID, directory } }],
+        location: { directory },
+      })
+      await settle()
+    },
     /** Render the system prompt for one session through the registered hook. */
     system: async (sessionID: string): Promise<string> => {
       const event: SystemHookEvent = { sessionID, system: [] }
@@ -255,7 +273,7 @@ describe('TUI command plane + server driver', () => {
     }
   })
 
-  test('a goal that only survived a restart stays quiet until resumed', async () => {
+  test('a goal that only survived a restart auto-starts when a session opens', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-integration-restart-'))
     try {
       // yesterday: a goal was created and left active
@@ -263,20 +281,58 @@ describe('TUI command plane + server driver', () => {
       await previous.tool('create_goal').execute({ objective: 'yesterday objective' })
       await previous.cleanup()
 
-      // today: a fresh server process materializes its store
+      // today: a fresh server process materializes its store. The goal only
+      // survived, so an idle with no session activity stays quiet.
       const server = await serverHalf(directory)
       await server.idle('ses-restart')
       expect(server.prompts.length).toBe(0)
 
-      // the user resumes it explicitly from the TUI
-      const tui = tuiHalf(directory)
-      await tui.command.run('resume')
-      expect(tui.prompts.length).toBe(1)
-      await server.idle('ses-restart')
+      // the user opens a session: no manual resume, round 1 runs there
+      await server.created('ses-restart')
       expect(server.prompts.length).toBe(1)
-      expect(server.prompts[0].text).toContain('round 2/25')
+      expect(server.prompts[0].text).toContain('round 1/25')
+      expect(server.prompts[0].text).toContain('yesterday objective')
 
-      tui.cleanup()
+      // the loop continues on idle in that session, with no further action
+      await server.idle('ses-restart')
+      expect(server.prompts.length).toBe(2)
+      expect(server.prompts[1].text).toContain('round 2/25')
+
+      // a session opened after that round finished adopts the goal and carries on
+      await server.created('ses-second')
+      expect(server.prompts.length).toBe(3)
+      expect(server.prompts[2].sessionID).toBe('ses-second')
+      expect(server.prompts[2].text).toContain('round 3/25')
+
+      // a list-shaped creation payload drives the same round
+      await server.createdList('ses-third')
+      expect(server.prompts.length).toBe(4)
+      expect(server.prompts[3].sessionID).toBe('ses-third')
+      expect(server.prompts[3].text).toContain('round 4/25')
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a goal left waiting is not woken by a session opening', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-integration-adopt-wait-'))
+    try {
+      const server = await serverHalf(directory)
+      // the model asks to wait for an external event
+      await server.tool('create_goal').execute({ objective: 'waiting objective' })
+      const goal = JSON.parse((await server.tool('get_goal').execute({})).content).goal
+      await server.tool('goal_wait').execute({
+        goal_id: goal.id,
+        revision: goal.revision,
+        reason: 'waiting for review',
+        resume_after_ms: 600_000,
+      })
+
+      await server.created('ses-wait')
+      expect(server.prompts.length).toBe(0)
+
       await server.cleanup()
     } finally {
       rmSync(directory, { recursive: true, force: true })

@@ -2,6 +2,10 @@
  * Goal continuation driver: watches for `session.idle` and injects one guarded
  * continuation prompt per goal round while the goal is active and armed.
  *
+ * A session being created is the other trigger: opening a session in a project
+ * with an active goal arms it and admits the next round, so a goal that merely
+ * survived a restart keeps running without a human resuming it by hand.
+ *
  * Guardrails (pi-goal-style):
  * - Round cap (`maxGoalRounds`): reaching it blocks the goal with
  *   `round-limit` — the DSH round-budget posture.
@@ -110,6 +114,15 @@ export class GoalDriver {
   private readonly inflight = new Map<string, Promise<void>>()
   private readonly stores = new Map<string, GoalStore>()
   private readonly accounted = new Map<string, AccountedState>()
+  /** Sessions this driver already auto-started, so one opening is one start. */
+  private readonly started = new Set<string>()
+  /**
+   * The session currently running a goal round, per project directory. A second
+   * session opening while one is mid-round must not start a parallel round on
+   * the same goal; a round that finished releases the project for the next
+   * session to adopt.
+   */
+  private readonly running = new Map<string, string>()
   private directory = ''
 
   constructor(private readonly hooks: DriverHooks) {}
@@ -128,6 +141,32 @@ export class GoalDriver {
       this.stores.set(directory, store)
     }
     return store
+  }
+
+  /**
+   * Handle a newly created session: opening a session in a project with an
+   * active goal is the human's go-ahead, so the goal is armed and its next
+   * round is admitted here — no manual `/goal resume` needed. A goal that is
+   * paused, blocked, completed, waiting on an external event, or already
+   * mid-round in another session is left alone.
+   */
+  async onSessionCreated(sessionID: string, directory: string): Promise<void> {
+    if (this.started.has(sessionID)) return
+    this.started.add(sessionID)
+    const store = this.storeFor(directory)
+    const goal = store.view()
+    if (goal === undefined || goal.phase !== 'active') return
+    // an external wait stays suppressed: goal_wait means quiet until the
+    // deadline or the next human turn, not until the next session opens
+    if (store.waitUntil > Date.now()) return
+    // another session of this project is running the goal's current round
+    const active = this.running.get(directory)
+    if (active !== undefined && active !== sessionID) return
+    // the goal survived this process (or a previous one) disarmed: opening a
+    // session re-arms it, and the round below admits it like a resume would
+    store.activation = 'armed'
+    this.hooks.log('goal adopted by new session', { goalID: goal.id, sessionID, round: goal.roundsStarted + 1 })
+    await this.drive(store, sessionID, goal, directory)
   }
 
   /** Handle one `session.idle` event: account the finished turn, then maybe inject the next goal round. */
@@ -151,7 +190,7 @@ export class GoalDriver {
     await this.accountSession(sessionID, store)
     const goal = store.view()
     if (goal === undefined || goal.phase !== 'active' || goal.activation !== 'armed') return
-    await this.drive(store, sessionID, goal)
+    await this.drive(store, sessionID, goal, directory)
   }
 
   /**
@@ -203,7 +242,7 @@ export class GoalDriver {
   }
 
   /** Apply guardrails and inject one continuation round. */
-  private async drive(store: GoalStore, sessionID: string, goal: GoalView): Promise<void> {
+  private async drive(store: GoalStore, sessionID: string, goal: GoalView, directory: string): Promise<void> {
     const now = Date.now()
 
     // external wait: quiet until the deadline passes or non-goal work wakes us
@@ -227,16 +266,27 @@ export class GoalDriver {
     const admitted = store.continue({ id: goal.id, revision: goal.revision })
     this.hooks.log('goal round started', { goalID: goal.id, round, revision: admitted.revision })
 
+    // claim the project for this session while the round runs: a second
+    // session opening meanwhile defers to it instead of racing the same goal
+    this.running.set(directory, sessionID)
+
     // the round is admitted: submitting it must not stall the driver, because
     // the next `session.idle` (not this call) accounts the turn and admits the
     // round after it
-    void this.hooks.session.prompt({ sessionID, text }).catch((error: unknown) => {
-      this.hooks.log(`goal round errored: ${error instanceof Error ? error.message : String(error)}`, {
-        goalID: goal.id,
-        round,
+    void this.hooks.session
+      .prompt({ sessionID, text })
+      .then(() => {
+        // the round finished: the next session to open may adopt the goal
+        if (this.running.get(directory) === sessionID) this.running.delete(directory)
       })
-      // do not loop on provider errors: disarm so the next human turn decides
-      store.activation = 'disarmed'
-    })
+      .catch((error: unknown) => {
+        this.hooks.log(`goal round errored: ${error instanceof Error ? error.message : String(error)}`, {
+          goalID: goal.id,
+          round,
+        })
+        // do not loop on provider errors: disarm so the next human turn decides
+        store.activation = 'disarmed'
+        if (this.running.get(directory) === sessionID) this.running.delete(directory)
+      })
   }
 }
