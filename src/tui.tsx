@@ -15,7 +15,7 @@
  * event that would otherwise wake the driver.
  */
 
-import { createRoot, createSignal, onCleanup, Show } from 'solid-js'
+import { createRoot, createSignal, onCleanup, Show, type JSX } from 'solid-js'
 import { executeGoalCommand, parseGoalCommand, type GoalCommandOutcome, type ParsedGoalCommand } from './commands.ts'
 import { goalBlockReason, renderGoalRoundPrompt } from './driver.ts'
 import { GoalStore } from './state.ts'
@@ -173,27 +173,42 @@ function GoalSidebarView(props: { goal: GoalView | undefined; onCommand(command:
   const summary = goalSidebarSummary(props.goal)
   return (
     <box flexDirection="column" style={{ padding: 1 }}>
-      <Show
-        when={props.goal !== undefined}
-        fallback={<text style={{ fg: 'gray' }}>{summary.headline}</text>}
-      >
-        <text>{summary.headline}</text>
-        <text style={{ fg: 'gray' }}>{summary.detail}</text>
-        <box flexDirection="row" style={{ gap: 1 }}>
-          <Show when={props.goal!.phase === 'active'}>
-            <text style={{ fg: 'gray' }} onMouseUp={() => props.onCommand('pause')}>
-              pause
-            </text>
-          </Show>
-          <Show when={props.goal!.phase !== 'active'}>
-            <text style={{ fg: 'gray' }} onMouseUp={() => props.onCommand('resume')}>
-              resume
-            </text>
-          </Show>
-          <text style={{ fg: 'gray' }} onMouseUp={() => props.onCommand('clear')}>
-            clear
-          </text>
-        </box>
+      {/*
+        The `goal` value reaches the rows through `Show`'s children callback:
+        JSX props are evaluated when the tree is constructed, so a bare
+        `props.goal.phase` here would throw on the empty goal before `Show` ever
+        decides which branch to render.
+      */}
+      <Show when={props.goal} fallback={<text style={{ fg: 'gray' }}>{summary.headline}</text>}>
+        {(goal): JSX.Element => {
+          const view = goal()
+          return (
+            <>
+              <text>{summary.headline}</text>
+              <text style={{ fg: 'gray' }}>{summary.detail}</text>
+              {/*
+                A ternary, not a nested `<Show>`: a falsy `Show` inside a `<box>`
+                makes the opentui renderer's `insertExpression` clear the parent's
+                children and insert an empty text node into it, which throws an
+                orphan-text error.
+              */}
+              <box flexDirection="row" style={{ gap: 1 }}>
+                {view.phase === 'active' ? (
+                  <text style={{ fg: 'gray' }} onMouseUp={() => props.onCommand('pause')}>
+                    pause
+                  </text>
+                ) : (
+                  <text style={{ fg: 'gray' }} onMouseUp={() => props.onCommand('resume')}>
+                    resume
+                  </text>
+                )}
+                <text style={{ fg: 'gray' }} onMouseUp={() => props.onCommand('clear')}>
+                  clear
+                </text>
+              </box>
+            </>
+          )
+        }}
       </Show>
     </box>
   )

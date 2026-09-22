@@ -2,6 +2,8 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createComponent, createRoot } from 'solid-js'
+import { RendererContext } from '@opentui/solid'
 import {
   createGoalTuiPlugin,
   goalSidebarSummary,
@@ -138,6 +140,32 @@ function setup(): Mock {
   }
 }
 
+/**
+ * opentui constructs elements through the renderer context: a stub is enough,
+ * because nothing is laid out or painted here — only the JSX is evaluated.
+ */
+const stubRenderer = {
+  requestRender: () => {},
+  registerLifecyclePass: () => {},
+  on: () => {},
+  off: () => {},
+  width: 80,
+  height: 24,
+} as never
+
+/** Mount one slot claim the way the TUI renders it, and return its dispose. */
+function mountSlot(claim: SlotClaim): () => void {
+  return createRoot(dispose => {
+    createComponent(RendererContext.Provider as never, {
+      value: stubRenderer,
+      get children() {
+        return claim.render({ sessionID: 'ses-goal' })
+      },
+    } as never)
+    return dispose
+  })
+}
+
 describe('tui goal command plane', () => {
   test('registers the keymap layer from the TUI render tree, never from setup', () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-tui-'))
@@ -154,6 +182,22 @@ describe('tui goal command plane', () => {
     harness.slots.find(claim => claim.append === 'app')?.render({})
     expect(harness.layers.length).toBe(1)
     expect(harness.layers[0].commands.map(command => command.id)).toContain('goal.command')
+  })
+
+  test('the sidebar renders with no goal set and after a create', async () => {
+    const mock = setup()
+    // Solid evaluates JSX props eagerly, so the empty goal must be guarded by
+    // `Show`'s children — never by a bare `props.goal.phase` in JSX
+    const empty = mock.slot('sidebar.content')
+    expect(empty).toBeDefined()
+    expect(() => mountSlot(empty!)).not.toThrow()
+
+    await mock.command('goal.command').run!('sidebar objective')
+    expect(() => mountSlot(mock.slot('sidebar.content')!)).not.toThrow()
+
+    // the paused goal takes the other branch of the phase ternary
+    await mock.command('goal.command').run!('pause')
+    expect(() => mountSlot(mock.slot('sidebar.content')!)).not.toThrow()
   })
 
   test('registers the /goal slash command, palette entries, and the sidebar slot', () => {
