@@ -3,3 +3,4 @@ dist/
 *.log
 .test-workspace/
 .opencode-goal/
+.opencode/goal-log.jsonl
