@@ -5,146 +5,107 @@
  * phase/activation, round budget) with the pi-goal guardrails (token budgets,
  * no-progress detection, external waits, stale-turn guards).
  *
- * Load as a plugin: `opencode plugin opencode-goal`, or drop into
- * `.opencode/plugins/` / `~/.config/opencode/plugins/`.
+ * This is the server half: model-facing goal tools plus the `session.idle`
+ * continuation driver. The human `/goal` slash command lives in the TUI half
+ * (`tui.tsx`) and executes directly in the UI without a server round trip; both
+ * halves converge on `<worktree>/.opencode/goal-log.jsonl`.
+ *
+ * opencode 2.x loads this as a plugin definition — an object with an `id` and a
+ * `setup` function that receives the plugin context. Everything is registered
+ * imperatively on that context inside `setup`: the goal tools through
+ * `tool.transform`, the system-prompt goal block through `session.hook`, and
+ * the continuation driver through `event.subscribe`. The plugin is loaded once
+ * per location, so it owns one store keyed by its load directory
+ * (`ctx.location.directory`).
  */
 
-import type { Plugin } from '@opencode-ai/plugin'
+import type { Plugin } from '@opencode/plugin'
 import { GoalDriver } from './driver.ts'
 import { GoalStore } from './state.ts'
-import { executeGoalCommand, parseGoalCommand } from './commands.ts'
 import { goalTools } from './tools.ts'
 
-export const OpenCodeGoalPlugin: Plugin = async ({ client, directory, worktree }) => {
-  const root = worktree && worktree.length > 0 ? worktree : directory
+/** Build the server-half plugin definition. */
+export const OpenCodeGoalPlugin: Plugin.Plugin = {
+  id: 'opencode-goal',
 
-  /** One event-sourced store per project root. */
-  const stores = new Map<string, GoalStore>()
-  const getStore = (dir: string): GoalStore => {
-    const key = dir || root
-    let store = stores.get(key)
-    if (store === undefined) {
-      store = new GoalStore(key)
-      stores.set(key, store)
+  async setup(ctx) {
+    const root = ctx.location.directory
+
+    /** One event-sourced store per project root. */
+    const stores = new Map<string, GoalStore>()
+    const getStore = (dir: string): GoalStore => {
+      const key = dir.length > 0 ? dir : root
+      let store = stores.get(key)
+      if (store === undefined) {
+        store = new GoalStore(key)
+        stores.set(key, store)
+      }
+      return store
     }
-    return store
-  }
 
-  const driver = new GoalDriver({
-    getStore,
-    client,
-    log: (message, extra) => {
-      void client.app.log({
-        body: {
-          service: 'opencode-goal',
-          level: 'info',
-          message,
-          extra: extra ?? {},
-        },
-      }).catch(() => {
-        console.log(`[opencode-goal] ${message}`, extra ?? '')
-      })
-    },
-  })
-  driver.setDirectory(root)
+    const log = (message: string, extra?: Record<string, unknown>): void => {
+      console.log(`[opencode-goal] ${message}`, extra ?? '')
+    }
 
-  await client.app.log({
-    body: {
-      service: 'opencode-goal',
-      level: 'info',
-      message: 'opencode-goal plugin initialized',
-      extra: { root, worktree },
-    },
-  }).catch(() => {
-    console.log('[opencode-goal] plugin initialized', { root })
-  })
+    const driver = new GoalDriver({
+      getStore,
+      session: ctx.session,
+      log,
+    })
+    driver.setDirectory(root)
 
-  return {
-    tool: goalTools(getStore),
+    // Materialize the root store now: a store that already exists observes later
+    // external mutations (e.g. a `/goal` create from the TUI command plane) as
+    // changes and arms the driver. A store created lazily after such a mutation
+    // would treat the goal as pre-existing and stay disarmed.
+    getStore(root)
 
-    'command.execute.before': async (input, output) => {
-      if (input.command !== 'goal') return
-      // resolve the session's project directory so tools, commands, and the
-      // driver all share one store key
-      let dir = root
-      try {
-        const session = await client.session.get({ path: { id: input.sessionID } })
-        if (session.data?.directory && session.data.directory.length > 0) dir = session.data.directory
-      } catch {
-        // fall back to the plugin root
-      }
-      const store = getStore(dir)
-      let result: string
-      try {
-        result = executeGoalCommand(store, parseGoalCommand(input.arguments))
-      } catch (error: unknown) {
-        result = error instanceof Error ? `goal command failed: ${error.message}` : 'goal command failed'
-      }
-      // inject the command result as reply parts
-      output.parts = [{ type: 'text', text: result, synthetic: true }] as typeof output.parts
-    },
+    log('plugin initialized', { root })
 
-    event: async ({ event }) => {
-      switch (event.type) {
-        case 'session.idle': {
-          // derive the project directory for this session if possible
-          let dir = root
-          try {
-            const session = await client.session.get({ path: { id: event.properties.sessionID } })
-            if (session.data?.directory && session.data.directory.length > 0) dir = session.data.directory
-          } catch {
-            // fall back to the plugin root
-          }
-          await driver.onSessionIdle(event.properties.sessionID, dir)
-          return
-        }
-        case 'message.updated': {
-          const info = event.properties.info
-          if (info.role === 'assistant') {
-            // attribute provider-reported usage to the active goal
-            let dir = root
-            try {
-              const session = await client.session.get({ path: { id: info.sessionID } })
-              if (session.data?.directory && session.data.directory.length > 0) dir = session.data.directory
-            } catch {
-              // fall back to the plugin root
-            }
-            driver.onAssistantMessage(dir, {
-              tokens: info.tokens,
-              cost: info.cost,
-            })
-          }
-          return
-        }
-        default:
-          return
-      }
-    },
+    // Goal tools (`get_goal`, `create_goal`, `update_goal`, `goal_wait`).
+    const tools = goalTools(root, getStore)
+    const toolRegistration = await ctx.tool.transform((editor) => {
+      for (const tool of tools) editor.add(tool)
+    })
 
-    'experimental.chat.system.transform': async (input, output) => {
-      let dir = root
-      if (input.sessionID !== undefined) {
-        try {
-          const session = await client.session.get({ path: { id: input.sessionID } })
-          if (session.data?.directory && session.data.directory.length > 0) dir = session.data.directory
-        } catch {
-          // fall back to the plugin root
-        }
-      }
-      const store = getStore(dir)
-      const goal = store.view()
+    // System-prompt injection: surface the active goal to every model turn. The
+    // plugin is loaded once per location, so its sessions share this directory
+    // and therefore this one goal log.
+    const systemHook = await ctx.session.hook('context', (event) => {
+      const goal = getStore(root).view()
       if (goal === undefined || goal.phase !== 'active') return
       const budget = goal.tokenBudget > 0
         ? ` | budget ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}`
         : ''
-      output.system.push(
-        [
+      event.system.push({
+        type: 'text',
+        text: [
           `[opencode-goal] Active goal (round ${goal.roundsStarted + 1}/${goal.maxGoalRounds}${budget}): ${goal.objective}`,
           'Keep working toward this objective across turns. Call get_goal to inspect it, update_goal(action="complete") with evidence when achieved, update_goal(action="blocked") for a true impasse, or goal_wait while waiting on external events.',
         ].join('\n'),
-      )
-    },
-  }
+      })
+    })
+
+    // Continuation driver: one guarded round per `session.idle` while the goal
+    // is active and armed. The event stream ends when the server shuts down.
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event.type !== 'session.idle') continue
+          void driver.onSessionIdle(event.data.sessionID, event.location?.directory ?? root)
+        }
+      } catch {
+        // the server closed the stream
+      }
+    })()
+
+    return async () => {
+      controller.abort()
+      await systemHook.dispose()
+      await toolRegistration.dispose()
+    }
+  },
 }
 
 export default OpenCodeGoalPlugin

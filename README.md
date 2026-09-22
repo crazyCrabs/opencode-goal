@@ -13,35 +13,39 @@ Built from the combined design philosophies of two goal systems:
 
 ## Install
 
-As a local plugin, drop the bundled `dist/index.js` into your project:
+The plugin ships as two bundles because opencode loads server plugins and TUI
+plugins through separate paths. Both are needed: the server half owns the goal
+state, tools, and continuation driver; the TUI half owns the `/goal` command.
+
+Drop both bundled files into your global config (or your project's
+`.opencode/plugins/`):
 
 ```
-.opencode/plugins/opencode-goal.js
+~/.config/opencode/plugins/opencode-goal.js     # dist/index.js — server half
+~/.config/opencode/plugins/opencode-goal-tui.js # dist/tui.js    — TUI half
 ```
 
-Or as an npm package (once published):
+Then register the TUI half in `~/.config/opencode/tui.json`:
+
+```json
+{
+  "plugin": ["./plugins/opencode-goal-tui.js"]
+}
+```
+
+The TUI bundle keeps `solid-js` and `@opentui/*` external, so those packages
+must resolve from the config directory (opencode installs them itself; verify
+with `ls ~/.config/opencode/node_modules/solid-js`).
+
+Or as an npm package (once published) for the server half:
 
 ```json
 { "plugin": ["opencode-goal"] }
 ```
 
-The `/goal` slash command is provided by a command file that teaches the model to
-use the goal tools. Create `.opencode/command/goal.md` (project) or
-`~/.config/opencode/command/goal.md` (global):
-
-```markdown
----
-description: Set or manage the autonomous goal for this session
----
-The user invoked the /goal command with: $ARGUMENTS
-
-Manage the session's autonomous goal using the available goal tools:
-- To view the current goal: call get_goal.
-- To set or replace a goal: call create_goal with the objective and optional max_goal_rounds / token_budget.
-- To pause, resume, mark complete, or mark blocked: call update_goal with the matching action.
-- To wait on an external event: call goal_wait.
-If the arguments look like a goal objective, set it with create_goal and report the result.
-```
+The `/goal` slash command is registered by the TUI plugin itself: it parses the
+input, executes it against the goal log, and shows the result as a toast or
+dialog. No command file and no model turn are involved.
 
 ## Usage
 
@@ -56,6 +60,10 @@ If the arguments look like a goal objective, set it with create_goal and report 
 /goal clear                             remove the goal (durable tombstone)
 ```
 
+A bare `/goal` with no goal set opens a prompt for the objective. The same
+actions are available in the command palette (`Goal: …` group) and in the
+sidebar row, which shows the phase, objective, and round/budget progress.
+
 While a goal is active, the model can use four tools:
 
 | Tool | Purpose |
@@ -67,16 +75,27 @@ While a goal is active, the model can use four tools:
 
 ## Architecture
 
+Two plugin halves share one durable log:
+
 ```
-session.idle ──► GoalDriver ──► guardrails ──► session.prompt (synthetic continuation)
-                     │              │
-                     ▼              ▼
-                GoalStore    round cap · token budget · no-progress · wait
-                     │
-                     ▼
-        .opencode/goal-log.jsonl   (append-only event log, DSH-style)
+TUI half (tui.js)                              Server half (index.js)
+
+/goal --> parse --> GoalStore --> toast / dialog / sidebar
+                        |                            |
+                        |                            +--> goal tools (get / create / update / wait)
+                        |                            +--> GoalDriver on session.idle
+                        v                                 |
+              .opencode/goal-log.jsonl <------------------+   (re-folded on every read)
 ```
 
+- **Command plane (DSH `command-goal` posture)**: `/goal` executes in the UI and
+  its output stays in the UI. No prompt parts are injected, so goal control never
+  costs a model turn. After a create/edit/resume the command plane also admits
+  and submits the first working round, because a locally executed slash command
+  produces no `session.idle` that would otherwise wake the driver.
+- **Continuation**: on `session.idle`, if the goal is `active` + `armed`, one
+  guarded round is admitted (CAS) and a synthetic continuation prompt is injected.
+  Provider errors disarm instead of looping.
 - **Event sourcing**: every mutation (`create` / `edit` / `pause` / `resume` /
   `complete` / `block` / `continue` / `wait` / `clear`) appends a full-snapshot
   `goal/change` event to `<project>/.opencode/goal-log.jsonl`. The current state
@@ -86,10 +105,10 @@ session.idle ──► GoalDriver ──► guardrails ──► session.prompt 
   newer goal instance.
 - **Orthogonal state**: durable `phase` (`active` / `paused` / `blocked` /
   `complete`) is separate from process-local `activation` (`armed` / `disarmed`).
-  After a reload the goal is `disarmed` — the DSH posture: a human must resume.
-- **Continuation**: on `session.idle`, if the goal is `active` + `armed`, one
-  guarded round is admitted (CAS) and a synthetic continuation prompt is injected.
-  Provider errors disarm instead of looping.
+  A store arms a goal newer than the ref it was born with, so a goal created or
+  resumed while the process is alive continues here — including a goal created
+  from the TUI — while a goal that only survived a restart stays quiet until a
+  human resumes it (the DSH posture).
 
 ## Guardrails
 
@@ -106,8 +125,8 @@ session.idle ──► GoalDriver ──► guardrails ──► session.prompt 
 ```bash
 bun install
 bun run typecheck   # tsc --noEmit
-bun test            # 22 unit/integration tests
-bun run build       # bundles dist/index.js (single file, deps included)
+bun test            # 55 unit/integration tests
+bun run build       # bundles dist/index.js (server) and dist/tui.js (TUI)
 ```
 
 ## License

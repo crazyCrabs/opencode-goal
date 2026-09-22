@@ -10,25 +10,34 @@ let store: GoalStore
 let driver: GoalDriver
 const promptCalls: Array<{ sessionID: string; text: string }> = []
 
-const client = {
-  session: {
-    prompt: async (input: { path: { id: string }; body: { parts: Array<{ type: string; text: string }> } }) => {
-      promptCalls.push({ sessionID: input.path.id, text: input.body.parts[0]?.text ?? '' })
-      return {
-        data: {
-          info: { tokens: { input: 100, output: 50 }, cost: 0.001 },
-          parts: [{ type: 'text', text: 'work done for this round' }],
-        },
-      }
-    },
+/**
+ * The slice of the opencode 2.x session domain the driver speaks to: a flat
+ * `{ sessionID, text }` prompt and a transcript read. Usage and round output
+ * are attributed from the transcript — opencode 2.x no longer emits
+ * `message.updated` — so the mock carries one finished assistant turn.
+ */
+const transcript = [
+  {
+    id: 'msg-driver-1',
+    type: 'assistant',
+    tokens: { input: 100, output: 50 },
+    cost: 0.001,
+    content: [{ type: 'text', text: 'work done for this round' }],
   },
-  app: { log: async () => ({}) },
+]
+
+const session = {
+  prompt: async (input: { sessionID: string; text: string }) => {
+    promptCalls.push({ sessionID: input.sessionID, text: input.text })
+    return {}
+  },
+  context: async () => transcript,
 }
 
 function makeDriver(st: GoalStore): GoalDriver {
   const d = new GoalDriver({
     getStore: () => st,
-    client: client as never,
+    session,
     log: () => {},
   })
   d.setDirectory(dir)
@@ -69,8 +78,8 @@ describe('continuation driver', () => {
     const budgeted = new GoalStore(mkdtempSync(join(tmpdir(), 'goal-driver-budget-')))
     const driver3 = makeDriver(budgeted)
     budgeted.create('budget goal', 25, 10)
-    await driver3.onSessionIdle('session-3', dir) // usage becomes 150 >= 10
-    await driver3.onSessionIdle('session-3', dir) // guardrail fires now
+    await driver3.onSessionIdle('session-3', dir) // the finished turn already spent 100 >= 10
+    await driver3.onSessionIdle('session-3', dir) // the guardrail has fired, nothing is admitted
     expect(budgeted.current?.phase).toBe('blocked')
     expect(budgeted.current?.blockedReason?.code).toBe('budget-limited')
   })

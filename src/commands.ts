@@ -1,7 +1,10 @@
 /**
  * Human-facing `/goal` command over the persisted per-project goal domain.
- * Implemented through the `command.execute.before` hook: when the user types
- * `/goal ...`, we parse, execute, and inject the result as reply parts.
+ *
+ * The command plane lives in the TUI plugin (see `tui.ts`): the user's input is
+ * parsed and executed here against the durable log, and the returned text is
+ * rendered directly in the UI. No prompt parts are injected, so no model turn
+ * is spent on goal control.
  */
 
 import type { GoalStore } from './state.ts'
@@ -9,11 +12,20 @@ import { GoalError, type GoalRef, type GoalView } from './types.ts'
 
 const USAGE = 'Usage: /goal [<objective>|status|edit <objective>|pause|resume|clear] | /goal --tokens <n> <objective> | /goal --rounds <n> <objective>'
 
-interface ParsedGoalCommand {
+/** One parsed `/goal` invocation; every non-control input is a create objective. */
+export interface ParsedGoalCommand {
   kind: 'show' | 'create' | 'edit' | 'pause' | 'resume' | 'clear' | 'invalid'
   objective?: string
   maxGoalRounds?: number
   tokenBudget?: number
+}
+
+/** Outcome of one executed `/goal` command. */
+export interface GoalCommandOutcome {
+  /** False when the command was rejected (usage error, state conflict, domain error). */
+  readonly ok: boolean
+  /** Direct UI output; it never enters a model request. */
+  readonly text: string
 }
 
 /** Parse only the grammar owned by `/goal`; arbitrary other input is an objective. */
@@ -101,41 +113,52 @@ function goalRef(goal: GoalView): GoalRef {
   return { id: goal.id, revision: goal.revision }
 }
 
-/** Execute one parsed human command through the domain that owns persistence. */
-export function executeGoalCommand(store: GoalStore, command: ParsedGoalCommand): string {
+/**
+ * Execute one parsed human command through the domain that owns persistence.
+ * Domain rejections become direct `ok: false` outcomes instead of throwing, so
+ * the UI can render them as plain text.
+ */
+export function executeGoalCommand(store: GoalStore, command: ParsedGoalCommand): GoalCommandOutcome {
   const current = store.view()
-  switch (command.kind) {
-    case 'show':
-      return current === undefined
-        ? `No goal is currently set.\n${USAGE}`
-        : renderGoal('Goal', current)
-    case 'invalid':
-      return `Invalid /goal command.\n${USAGE}`
-    case 'create': {
-      const objective = command.objective!
-      if (current !== undefined && current.phase !== 'complete') {
-        return `A goal is already ${phaseLabel(current.phase)}. Use /goal edit <objective> to change it or /goal clear before replacing it.`
+  const fail = (text: string): GoalCommandOutcome => ({ ok: false, text })
+  const ok = (text: string): GoalCommandOutcome => ({ ok: true, text })
+  try {
+    switch (command.kind) {
+      case 'show':
+        return current === undefined
+          ? ok(`No goal is currently set.\n${USAGE}`)
+          : ok(renderGoal('Goal', current))
+      case 'invalid':
+        return fail(`Invalid /goal command.\n${USAGE}`)
+      case 'create': {
+        const objective = command.objective!
+        if (current !== undefined && current.phase !== 'complete') {
+          return fail(`A goal is already ${phaseLabel(current.phase)}. Use /goal edit <objective> to change it or /goal clear before replacing it.`)
+        }
+        const view = store.create(objective, command.maxGoalRounds ?? 25, command.tokenBudget ?? 0)
+        return ok(renderGoal('Goal created (armed, autonomous continuation enabled)', view))
       }
-      const view = store.create(objective, command.maxGoalRounds ?? 25, command.tokenBudget ?? 0)
-      return renderGoal('Goal created (armed, autonomous continuation enabled)', view)
+      case 'edit': {
+        if (current === undefined) return fail(`No goal is currently set; /goal edit requires one.\n${USAGE}`)
+        const view = store.edit(goalRef(current), command.objective, undefined)
+        return ok(renderGoal('Goal updated', view))
+      }
+      case 'pause': {
+        if (current === undefined) return fail(`No goal is currently set; /goal pause requires one.\n${USAGE}`)
+        return ok(renderGoal('Goal paused', store.pause(goalRef(current))))
+      }
+      case 'resume': {
+        if (current === undefined) return fail(`No goal is currently set; /goal resume requires one.\n${USAGE}`)
+        return ok(renderGoal('Goal resumed (armed)', store.resume(goalRef(current))))
+      }
+      case 'clear': {
+        if (current === undefined) return ok('No goal to clear.')
+        store.clear(goalRef(current))
+        return ok('Goal cleared.')
+      }
     }
-    case 'edit': {
-      if (current === undefined) return `No goal is currently set; /goal edit requires one.\n${USAGE}`
-      const view = store.edit(goalRef(current), command.objective, undefined)
-      return renderGoal('Goal updated', view)
-    }
-    case 'pause': {
-      if (current === undefined) return `No goal is currently set; /goal pause requires one.\n${USAGE}`
-      return renderGoal('Goal paused', store.pause(goalRef(current)))
-    }
-    case 'resume': {
-      if (current === undefined) return `No goal is currently set; /goal resume requires one.\n${USAGE}`
-      return renderGoal('Goal resumed (armed)', store.resume(goalRef(current)))
-    }
-    case 'clear': {
-      if (current === undefined) return 'No goal to clear.'
-      store.clear(goalRef(current))
-      return 'Goal cleared.'
-    }
+  } catch (error) {
+    if (error instanceof GoalError) return fail(error.message)
+    throw error
   }
 }

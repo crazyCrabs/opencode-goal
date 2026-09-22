@@ -1,7 +1,13 @@
 /**
  * Event-sourced goal store (DSH-style): an append-only JSONL log of
  * `goal/change` events with a last-wins projection fold and compare-and-set
- * mutations. Activation is process-local and never persisted.
+ * mutations. Activation is process-local and never persisted, but every read
+ * path re-folds the log first so multiple writers — the server-side goal
+ * tools/driver and the TUI `/goal` command plane — converge on one state.
+ *
+ * A store arms a goal that is newer than the ref it was born with, so a goal
+ * created or resumed while this process is alive continues here, while a goal
+ * that merely survived a restart stays quiet until an explicit resume.
  *
  * Log location: `<worktree>/.opencode/goal-log.jsonl` — per-project, durable
  * across reloads, and auditable like DSH's session event log.
@@ -28,6 +34,19 @@ import {
 
 const GOAL_CHANGE_VERSION = 1
 
+/** Coerce a possibly-missing legacy `tokenBudget` field into the durable shape. */
+function normalizeSnapshot(snapshot: GoalSnapshot): GoalSnapshot {
+  const budget = snapshot.tokenBudget
+  if (typeof budget === 'number' && Number.isFinite(budget) && budget > 0) return snapshot
+  return { ...snapshot, tokenBudget: 0 }
+}
+
+/** Whether two folded snapshots describe the same durable goal identity. */
+function sameGoal(a: GoalSnapshot | undefined, b: GoalSnapshot | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.id === b.id && a.revision === b.revision && a.phase === b.phase
+}
+
 /** Fold state rebuilt from the log. */
 export interface GoalFoldState {
   /** Current goal snapshot, absent after a clear or before the first create. */
@@ -53,7 +72,7 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
       goal = undefined
       lastRef = change.cleared
     } else {
-      goal = change.goal
+      goal = normalizeSnapshot(change.goal)
       lastRef = { id: change.goal.id, revision: change.goal.revision }
     }
   }
@@ -63,23 +82,18 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
 /** Per-session runtime state held only in this process. */
 interface RuntimeState {
   activation: GoalActivation
-  tokenBudget: number
   waitUntil: number
   waitReason: string | undefined
   /** Normalized assistant outputs of recent goal rounds (no-progress guard). */
   recentOutputs: string[]
-  /** Latest continuation prompt message id (to attribute assistant replies). */
-  lastContinuationMessageID: string | undefined
 }
 
 function emptyRuntime(): RuntimeState {
   return {
     activation: 'disarmed',
-    tokenBudget: 0,
     waitUntil: 0,
     waitReason: undefined,
     recentOutputs: [],
-    lastContinuationMessageID: undefined,
   }
 }
 
@@ -89,6 +103,14 @@ export class GoalStore {
   private state: GoalFoldState
   private readonly runtime: RuntimeState
   private seq = 0
+  /**
+   * The goal ref this store was born with (undefined when the log held no
+   * goal). A goal newer than that — a different id or a higher revision — was
+   * mutated while this process was alive, so it continues here; a goal that
+   * merely survived a restart keeps its durable phase but stays disarmed until
+   * a human explicitly resumes it (the DSH posture).
+   */
+  private readonly bornWith: GoalRef | undefined
 
   constructor(worktree: string) {
     this.logPath = `${worktree}/.opencode/goal-log.jsonl`
@@ -99,6 +121,74 @@ export class GoalStore {
       this.state = foldGoalLog(lines)
       this.seq = lines.filter(l => l.trim().length > 0).length
     }
+    const born = this.state.goal
+    this.bornWith = born === undefined ? undefined : { id: born.id, revision: born.revision }
+    this.applyActivation(born)
+  }
+
+  /**
+   * Arm only a goal mutated after this store came alive. A create/edit/resume
+   * from any writer — including the TUI `/goal` command plane — therefore arms
+   * every live process, while an untouched goal from a previous run waits for
+   * an explicit resume.
+   */
+  private applyActivation(goal: GoalSnapshot | undefined): void {
+    const mutatedWhileAlive =
+      goal !== undefined &&
+      (this.bornWith === undefined || goal.id !== this.bornWith.id || goal.revision > this.bornWith.revision)
+    this.runtime.activation = goal !== undefined && goal.phase === 'active' && mutatedWhileAlive ? 'armed' : 'disarmed'
+  }
+
+  /**
+   * Re-fold the durable log and adopt mutations made by other writers (the TUI
+   * `/goal` command plane writes the same file). The log is the only shared
+   * source of truth, so every read path folds it before answering.
+   *
+   * Runtime state is preserved except where an external change makes it wrong:
+   * a mutation newer than this store's birth arms it, any non-active phase
+   * disarms it, and a new or cleared goal resets the process-local
+   * wait/no-progress bookkeeping.
+   */
+  sync(): void {
+    if (!existsSync(this.logPath)) {
+      const previous = this.state.goal
+      if (previous === undefined) return
+      this.state = { goal: undefined, lastRef: this.state.lastRef }
+      this.applyExternalChange(previous, undefined)
+      return
+    }
+    let lines: string[]
+    try {
+      lines = readFileSync(this.logPath, 'utf8').split('\n')
+    } catch {
+      return // a concurrent append made the read fail; the next sync retries
+    }
+    const folded = foldGoalLog(lines)
+    const previous = this.state.goal
+    if (sameGoal(previous, folded.goal)) return
+    this.state = folded
+    this.applyExternalChange(previous, folded.goal)
+  }
+
+  /** Adopt an externally folded goal, preserving usage accounting. */
+  private applyExternalChange(previous: GoalSnapshot | undefined, next: GoalSnapshot | undefined): void {
+    if (next === undefined) {
+      // external clear: drop every process-local trace of the goal
+      this.runtime.activation = 'disarmed'
+      this.runtime.waitUntil = 0
+      this.runtime.waitReason = undefined
+      this.runtime.recentOutputs.length = 0
+      this.usageOverlay = undefined
+      return
+    }
+    const replaced = previous === undefined || previous.id !== next.id
+    if (replaced || next.phase !== previous?.phase) {
+      this.runtime.waitUntil = 0
+      this.runtime.waitReason = undefined
+      this.runtime.recentOutputs.length = 0
+    }
+    if (replaced) this.usageOverlay = undefined
+    this.applyActivation(next)
   }
 
   /** Current durable goal or undefined. */
@@ -117,11 +207,7 @@ export class GoalStore {
 
   /** Token budget (0 = unlimited). */
   get tokenBudget(): number {
-    return this.runtime.tokenBudget
-  }
-
-  set tokenBudget(value: number) {
-    this.runtime.tokenBudget = value
+    return this.view()?.tokenBudget ?? 0
   }
 
   /** External-wait deadline (epoch ms; 0 = none). */
@@ -143,13 +229,13 @@ export class GoalStore {
 
   /** Current goal view including process-local state and live usage overlay. */
   view(): GoalView | undefined {
+    this.sync()
     const goal = this.state.goal
     if (goal === undefined) return undefined
     return {
       ...goal,
       usage: this.effectiveUsage(goal),
       activation: this.runtime.activation,
-      tokenBudget: this.runtime.tokenBudget,
       waitUntil: this.runtime.waitUntil,
       waitReason: this.runtime.waitReason,
     }
@@ -197,15 +283,6 @@ export class GoalStore {
     this.runtime.recentOutputs.length = 0
   }
 
-  /** Remember the continuation prompt message id for output attribution. */
-  setLastContinuationMessageID(id: string | undefined): void {
-    this.runtime.lastContinuationMessageID = id
-  }
-
-  get lastContinuationMessageID(): string | undefined {
-    return this.runtime.lastContinuationMessageID
-  }
-
   /** Add assistant usage to the goal's cumulative counters. */
   addUsage(usage: Partial<GoalUsage>): void {
     const goal = this.state.goal
@@ -228,6 +305,7 @@ export class GoalStore {
 
   /** Reject a stale or missing current-state ref. */
   private expectCurrent(ref: GoalRef): GoalSnapshot {
+    this.sync()
     const current = this.state.goal
     if (current === undefined) throw new GoalError('GOAL_NOT_FOUND', 'no current goal')
     if (ref.id !== current.id || ref.revision !== current.revision) {
@@ -264,6 +342,14 @@ export class GoalStore {
     return Math.max(Date.now(), goal.updatedAt)
   }
 
+  /** Validate a caller-visible non-negative safe-integer token budget. */
+  private static resolveTokenBudget(value: number): number {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new GoalError('GOAL_INVALID_TOKEN_BUDGET', 'tokenBudget must be a non-negative safe integer (0 = unlimited)')
+    }
+    return value
+  }
+
   /** Validate a caller-visible positive safe-integer round cap. */
   private static resolveMaxGoalRounds(value: number): number {
     if (!Number.isSafeInteger(value) || value < 1) {
@@ -293,6 +379,8 @@ export class GoalStore {
   create(objective: string, maxGoalRounds: number, tokenBudget: number): GoalView {
     const resolvedObjective = GoalStore.resolveObjective(objective)
     const resolvedRounds = GoalStore.resolveMaxGoalRounds(maxGoalRounds)
+    const resolvedBudget = GoalStore.resolveTokenBudget(tokenBudget)
+    this.sync()
     const current = this.state.goal
     if (current !== undefined && current.phase !== 'complete') {
       throw new GoalError('GOAL_ALREADY_EXISTS', `goal "${current.id}" already exists with phase "${current.phase}"`)
@@ -305,6 +393,7 @@ export class GoalStore {
         objective: resolvedObjective,
         phase: 'active',
         maxGoalRounds: resolvedRounds,
+        tokenBudget: resolvedBudget,
         createdAt: now,
         updatedAt: now,
         roundsStarted: 0,
@@ -318,7 +407,6 @@ export class GoalStore {
       goal,
     })
     this.runtime.activation = 'armed'
-    this.runtime.tokenBudget = tokenBudget
     this.runtime.waitUntil = 0
     this.runtime.waitReason = undefined
     this.resetNoProgress()
@@ -489,7 +577,6 @@ export class GoalStore {
     }
     this.commit(change)
     this.runtime.activation = 'disarmed'
-    this.runtime.tokenBudget = 0
     this.runtime.waitUntil = 0
     this.runtime.waitReason = undefined
     this.resetNoProgress()

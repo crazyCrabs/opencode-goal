@@ -51,6 +51,12 @@ export interface GoalSnapshot extends GoalRef {
   readonly blockedReason?: GoalBlockReason
   /** Total admitted goal-round cap. */
   readonly maxGoalRounds: number
+  /**
+   * Optional total token budget (0 = unlimited). Durable so every writer —
+   * the server-side goal tools and the TUI `/goal` command — observes one
+   * value; process-local state cannot be shared across writers.
+   */
+  readonly tokenBudget: number
   /** Epoch milliseconds of the create mutation. */
   readonly createdAt: number
   /** Epoch milliseconds of the latest mutation. */
@@ -65,8 +71,6 @@ export interface GoalSnapshot extends GoalRef {
 export interface GoalView extends GoalSnapshot {
   /** Process-local continuation eligibility; never persisted. */
   readonly activation: GoalActivation
-  /** Optional token budget (0 = unlimited). */
-  readonly tokenBudget: number
   /** Optional external-wait deadline (epoch ms; 0 = none). */
   readonly waitUntil: number
   /** Reason recorded when waiting. */
