@@ -82,6 +82,13 @@ While a goal is active, the model can use four tools:
 | `update_goal` | `complete` / `blocked` / `pause` / `resume` / `edit` — CAS-validated |
 | `goal_wait` | Wait for an external event; suppresses continuation until the deadline |
 
+All four tools are registered with `options: { codemode: false }`, which opts them
+out of opencode 2.x Code Mode: without it a plugin tool only lands in the Code
+Mode catalog and must be invoked through the synthetic `execute` tool, so a model
+that calls `get_goal` by name gets *"No tool named get_goal is currently
+available"*. These tools are the plugin's whole model-facing contract and the
+system prompt names them directly, so they are first-class tools.
+
 ## Architecture
 
 Two plugin halves share one durable log:
@@ -140,7 +147,7 @@ TUI half (tui.js)                              Server half (index.js)
 ```bash
 bun install
 bun run typecheck   # tsc --noEmit
-bun test            # 61 unit/integration tests
+bun test            # 64 unit/integration tests
 bun run build       # bundles dist/index.js (server) and dist/tui.js (TUI)
 ```
 

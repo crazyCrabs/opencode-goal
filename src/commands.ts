@@ -94,11 +94,17 @@ function renderGoal(title: string, goal: GoalView): string {
     ? `Budget: ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget} tokens`
     : 'Budget: unlimited'
   const wait = goal.waitUntil > 0 ? [`Waiting: ${goal.waitReason ?? 'external event'} until ${new Date(goal.waitUntil).toISOString()}`] : []
+  // an active goal this process has not armed will not run on its own: name the
+  // command that starts it instead of leaving the reader at a dead end
+  const idle = goal.phase === 'active' && goal.activation === 'disarmed'
+    ? [`Next step: /goal resume starts round ${goal.roundsStarted + 1}.`]
+    : []
   return [
     title,
     `Status: ${phaseLabel(goal.phase)} (activation: ${goal.activation})`,
     ...blocker,
     ...wait,
+    ...idle,
     `Objective: ${goal.objective}`,
     `Rounds: ${goal.roundsStarted}/${goal.maxGoalRounds}`,
     budget,

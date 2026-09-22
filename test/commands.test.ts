@@ -74,6 +74,15 @@ describe('goal command execution', () => {
     expect(store.current?.objective).toBe('finish the migration')
   })
 
+  test('status names the command that starts a goal this process has not armed', () => {
+    // a fresh store: the goal only survived, so it is disarmed here
+    const observer = new GoalStore(dir)
+    const outcome = executeGoalCommand(observer, parseGoalCommand('status'))
+    expect(outcome.ok).toBe(true)
+    expect(outcome.text).toContain('Status: active (activation: disarmed)')
+    expect(outcome.text).toContain('Next step: /goal resume starts round 1.')
+  })
+
   test('pause and resume round-trip through the command', () => {
     const store = new GoalStore(dir)
     const paused = executeGoalCommand(store, parseGoalCommand('pause'))

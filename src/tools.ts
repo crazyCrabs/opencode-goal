@@ -52,6 +52,18 @@ function goalValue(goal: GoalView | undefined): unknown {
 /** Raw model arguments as the server forwards them. */
 type RawArgs = Record<string, unknown>
 
+/**
+ * Register the goal tools as first-class, directly callable tools.
+ *
+ * opencode 2.x defaults plugin tools to Code Mode: a tool whose options leave
+ * `codemode` unset only lands in the Code Mode catalog and must be invoked
+ * through the synthetic `execute` tool. These four tools are the plugin's whole
+ * model-facing contract and both the system prompt and the continuation prompt
+ * name them directly, so the model must be able to call them by name — the same
+ * way it calls `read` or `write`.
+ */
+const DIRECT_TOOL_OPTIONS = { codemode: false } as const
+
 /** Read one required non-empty string argument. */
 function requireString(args: RawArgs, field: string): string {
   const value = args[field]
@@ -107,6 +119,7 @@ export function goalTools(
       name: 'get_goal',
       description:
         'Read the current goal of this project, including its exact id/revision, objective, phase, rounds, round limit, token budget, usage, and whether a continuation is armed. Call this before update_goal.',
+      options: DIRECT_TOOL_OPTIONS,
       input: {
         type: 'object',
         properties: {},
@@ -121,6 +134,7 @@ export function goalTools(
       name: 'create_goal',
       description:
         'Create one persisted completion goal for the current project when the current task is a long-running objective that should continue across autonomous rounds. Replaces a completed goal; a non-complete goal must be cleared first. Starts autonomous continuation (rounds, guarded by the round cap).',
+      options: DIRECT_TOOL_OPTIONS,
       input: {
         type: 'object',
         properties: {
@@ -152,6 +166,7 @@ export function goalTools(
       name: 'update_goal',
       description:
         'Update the exact current goal revision. Actions: complete (mark achieved with evidence), blocked (report a true impasse), pause, resume, edit (objective and/or max_goal_rounds). Requires the exact goal_id and revision returned by get_goal; stale refs are rejected.',
+      options: DIRECT_TOOL_OPTIONS,
       input: {
         type: 'object',
         properties: {
@@ -229,6 +244,7 @@ export function goalTools(
       name: 'goal_wait',
       description:
         'Wait for an external event (e.g. a monitor, review, or CI run). Suppresses automatic continuation until the optional deadline (resume_after_ms) or until other non-goal work arrives. Use only after arranging an external wake source.',
+      options: DIRECT_TOOL_OPTIONS,
       input: {
         type: 'object',
         properties: {
