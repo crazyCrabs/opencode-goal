@@ -227,59 +227,32 @@ describe('the overlay accumulates', () => {
   })
 })
 
-describe('the step a goal completes in', () => {
-  // Reproduced on a live server: goal "Say the word banana and nothing else"
-  // called `goal_report` during step 1, the driver released its round when the
-  // goal went complete, and the step's own `session.step.ended` then arrived to
-  // find `isGoalTurn(sessionID)` false. Two step events carrying 10858 and 5335
-  // input tokens folded nothing at all; the goal recorded 0/0 and looked free.
-  const STEP: StepEndedData = {
-    sessionID: 'ses_banana',
-    assistantMessageID: 'msg_b1',
-    finish: 'tool-calls',
-    rawFinish: 'tool_calls',
-    cost: 0,
-    tokens: { input: 10858, output: 190, reasoning: 0, cache: { read: 476, write: 0 } },
-  }
+describe('usage folded after the last durable mutation', () => {
+  // Reproduced on a live opencode v2 server. A one-round goal ran four steps and
+  // folded 46196 input tokens; the goal recorded 22839. Every one of the four
+  // `session.step.ended` events reached `onStepEnded` and none was skipped by any
+  // of its guards — the first two steps sum to exactly 22839, and the goal's
+  // `complete` mutation was stamped 12ms before the third step arrived.
+  //
+  // `GoalStore.addUsage` sets an in-memory overlay and writes nothing durable;
+  // the overlay is carried by the *next* mutation, which then clears it. No
+  // mutation followed the third and fourth steps, so their usage was discarded.
+  const STEP_ONE_IN = 11390
+  const STEP_ONE_OUT = 45
+  const STEP_THREE_IN = 11495
+  const STEP_THREE_OUT = 191
 
-  /** A harness whose goal turns are decided by the driver, which releases a
-   *  round as soon as the goal stops being active. */
-  function accountingOver(store: GoalStore): GoalAccounting {
-    const inFlight = new Set<string>()
-    return new GoalAccounting({
-      storeFor: () => store,
-      isGoalTurn: (sessionID: string) => inFlight.has(sessionID),
-      // the driver adds to the set when a round starts and removes it on release
-      ...{},
-    })
-  }
-
-  // `test.failing`: the suite stays green while the defect is recorded, and
-  // turns red the day someone fixes it — which is the point of writing it down
-  // with numbers instead of in prose.
-  test.failing('its tokens are still folded, not dropped', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-banana-'))
+  // `test.failing`: the suite stays green while the defect is recorded, and turns
+  // red the day it is fixed.
+  test.failing('is not lost to the next reader of the durable log', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-'))
     const store = new GoalStore(dir)
-    store.create('say banana', 25, 0)
-
-    // the round is in flight while the step runs
-    const inFlight = new Set(['ses_banana'])
-    const accounting = new GoalAccounting({ storeFor: () => store, isGoalTurn: id => inFlight.has(id) })
-
-    accounting.onStepEnded(dir, STEP, 15)
-    expect(store.view()?.usage.inputTokens).toBe(10858 + 476)
-
-    // now the goal completes and the driver releases the round, before the
-    // step's own `session.step.ended` is delivered
-    store.complete({ id: store.view()!.id, revision: store.view()!.revision })
-    inFlight.delete('ses_banana')
-
-    const later: StepEndedData = { ...STEP, assistantMessageID: 'msg_b2', tokens: { input: 5335, output: 3, reasoning: 0, cache: { read: 6603, write: 0 } } }
-    accounting.onStepEnded(dir, later, 20)
-
-    // The goal is complete, so a step that spends money after that is not a
-    // round of it — but the step that *carried* the completion is, and here it
-    // is dropped, so a one-round goal records zero tokens.
-    expect(store.view()?.usage.inputTokens).toBe(10858 + 476 + 5335 + 6603)
+    store.create('overlay objective', 25, 0)
+    store.addUsage({ inputTokens: STEP_ONE_IN, outputTokens: STEP_ONE_OUT })
+    const current = store.view()!
+    store.continue({ id: current.id, revision: current.revision })
+    store.addUsage({ inputTokens: STEP_THREE_IN, outputTokens: STEP_THREE_OUT })
+    const reread = new GoalStore(dir).view()!
+    expect(reread.usage.inputTokens).toBe(STEP_ONE_IN + STEP_THREE_IN)
   })
 })
