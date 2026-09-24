@@ -17,7 +17,8 @@
 
 import { createRoot, createSignal, onCleanup, Show, type JSX } from 'solid-js'
 import { executeGoalCommand, parseGoalCommand, type GoalCommandOutcome, type ParsedGoalCommand } from './commands.ts'
-import { goalBlockReason, renderGoalRoundPrompt } from './driver.ts'
+import { admitRound, stopGoal } from './admission.ts'
+import { providerStopReason, renderGoalRoundPrompt } from './round-policy.ts'
 import { GoalStore } from './state.ts'
 import { GoalError, type GoalView } from './types.ts'
 
@@ -246,9 +247,17 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
         }
 
         /**
-         * Start the goal's first working round from the command plane: admit one
+         * Start the goal's next working round from the command plane: admit one
          * round and submit its continuation prompt. The server driver then
-         * continues from the following `session.idle`.
+         * continues from the following turn's completion event.
+         *
+         * This crosses the same admission seam the driver crosses. It used to
+         * carry its own copy of the policy, and the copies had drifted in two
+         * ways that mattered: a lost compare-and-set race escaped as an
+         * unhandled rejection, and an expired external wait was never cleared,
+         * so a goal whose deadline had passed sat quiet forever with nothing
+         * recording why. Both halves live in the seam now, so what a wait means
+         * when it ends is decided once.
          */
         const kickRound = async (store: GoalStore): Promise<void> => {
           const id = sessionID()
@@ -258,24 +267,49 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
             toast('info', NO_SESSION_HINT, ACTION_TOAST_MS)
             return
           }
-          if (isRunning(context, id)) return // a turn is active; the driver admits the next round at idle
-          const goal = store.view()
-          if (goal === undefined || goal.phase !== 'active') return
-          if (store.waitUntil > Date.now()) return
-          const blockReason = goalBlockReason(store, goal)
-          if (blockReason !== undefined) {
-            store.block({ id: goal.id, revision: goal.revision }, blockReason)
-            toast('warning', `Goal blocked (${blockReason.code}): ${blockReason.message}`, ACTION_TOAST_MS)
+          // A turn is active; the driver admits the next round at its
+          // completion. Deliberately NOT unified with the driver's in-flight
+          // check: this plane asks the UI because it holds the UI, the driver
+          // knows from its event stream because it submitted the prompt that
+          // started the turn. Neither can answer the other's question.
+          if (isRunning(context, id)) return
+
+          const verdict = admitRound(store)
+          if (verdict.kind === 'rejected') {
+            // not-active, disarmed, waiting and stale-ref all mean "nothing to
+            // do". `stale-ref` is the one worth naming: another writer admitted
+            // this round, so this command must not start a second one.
+            if (verdict.code === 'stale-ref') {
+              toast('info', 'Another writer already admitted this round.', ACTION_TOAST_MS)
+            }
             return
           }
-          const admitted = store.continue({ id: goal.id, revision: goal.revision })
+          if (verdict.kind === 'blocked') {
+            toast('warning', `Goal blocked (${verdict.reason.code}): ${verdict.reason.message}`, ACTION_TOAST_MS)
+            return
+          }
+
+          const goal = store.view()
+          if (goal === undefined) return
           try {
             await context.client?.session?.prompt({
               sessionID: id,
-              text: renderGoalRoundPrompt(admitted, admitted.roundsStarted),
+              text: renderGoalRoundPrompt(goal, verdict.round),
             })
           } catch (error) {
-            toast('error', `Goal round ${admitted.roundsStarted} failed to start: ${errorMessage(error)}`, ACTION_TOAST_MS)
+            // A provider refusal is the same stop the server driver records when
+            // a turn fails, so it is classified here by the same policy rather
+            // than reported as a toast and forgotten.
+            const stop = providerStopReason(error)
+            if (stop !== undefined) {
+              if (stopGoal(store, stop)) {
+                toast('warning', `Goal blocked (${stop.code}): ${stop.message}`, ACTION_TOAST_MS)
+              } else {
+                toast('warning', 'Goal already stopped by another writer.', ACTION_TOAST_MS)
+              }
+              return
+            }
+            toast('error', `Goal round ${verdict.round} failed to start: ${errorMessage(error)}`, ACTION_TOAST_MS)
           }
         }
 
@@ -415,8 +449,41 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
 
         // sidebar status view, refreshed on a poll plus TUI data events
         const [tick, setTick] = createSignal(0)
+        //
+        // An armed goal with nowhere to run yet starts itself when the user opens
+        // a session. `kickRound` could not do it at create time because there was
+        // no session to run in, and nothing else in this plugin reacts to a route
+        // change — the server driver's session-created handler is one-shot per
+        // session, so a session that already existed when the goal was created is
+        // never adopted by it. The poll that already refreshes the sidebar is this
+        // check's trigger, which also covers opening a session that already
+        // existed rather than creating a new one.
+        //
+        // Keyed by goal and session so one session starts one goal once: a goal
+        // re-created after a clear has a new id, so it starts again, and a second
+        // session is not started from while the first is running the goal.
+        //
+        const started = new Set<string>()
+        const autoStart = (): void => {
+          const id = sessionID()
+          const dir = directory()
+          if (id.length === 0 || dir.length === 0) return
+          const store = openStore(dir)
+          const goal = store.view()
+          if (goal === undefined || goal.phase !== 'active') return
+          if (started.has(`${goal.id}:${id}`)) return
+          // Arm before kicking, for the same reason the server driver arms on
+          // session adoption: this store is a fresh fold of the durable log, so a
+          // goal it did not create itself reads as disarmed, and admission would
+          // reject it as a goal nobody has touched. Opening a session *is* the
+          // human touching it, which is what makes arming right here.
+          store.activation = 'armed'
+          started.add(`${goal.id}:${id}`)
+          void kickRound(store)
+        }
         const bump = (): void => {
           setTick(value => value + 1)
+          autoStart()
         }
         const unsubscribe = context.data?.on?.('session.execution.succeeded', bump)
         const interval = refreshIntervalMs > 0 ? setInterval(bump, refreshIntervalMs) : undefined

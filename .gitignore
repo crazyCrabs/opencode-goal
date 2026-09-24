@@ -4,3 +4,4 @@ dist/
 .test-workspace/
 .opencode-goal/
 .opencode/goal-log.jsonl
+.env

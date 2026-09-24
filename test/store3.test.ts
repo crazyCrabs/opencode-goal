@@ -37,7 +37,7 @@ describe('event-sourced goal store: durability', () => {
     expect(store.hasRepeatedRounds()).toBe(false)
     expect(store.recordRoundOutput('hello')).toBe(true)
     expect(store.hasRepeatedRounds()).toBe(true)
-    store.resetNoProgress()
+    store.resetStallCounters()
     expect(store.hasRepeatedRounds()).toBe(false)
   })
 })

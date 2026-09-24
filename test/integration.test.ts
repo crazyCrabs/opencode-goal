@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createGoalTuiPlugin, type TuiGoalContext, type TuiKeymapCommandInput, type TuiKeymapLayerInput } from '../src/tui.tsx'
 import { OpenCodeGoalPlugin } from '../src/index.ts'
+import { GoalStore } from '../src/state.ts'
 
 /** One goal tool as the plugin registers it (opencode 2.x tool shape). */
 interface RegisteredTool {
@@ -111,9 +112,30 @@ function tuiHalf(directory: string) {
  */
 async function serverHalf(directory: string) {
   const prompts: Array<{ sessionID: string; text: string }> = []
+  /** Every `session.get` the adapter made, so a test can prove it made none. */
+  const getCalls: string[] = []
   const tools: RegisteredTool[] = []
   const queue: ServerEvent[] = []
   let systemHook: ((event: SystemHookEvent) => void | Promise<void>) | undefined
+  const inbox = {
+    push: async (
+      sessionID: string,
+      text: string,
+      itemType: string,
+      project: string,
+    ): Promise<void> => {
+      queue.push({
+        type: 'session.inbox.enqueued',
+        data: {
+          sessionID,
+          inboxID: `msg-${sessionID}`,
+          item: { type: itemType, payload: { text, files: [] }, delivery: 'steer' },
+        },
+        location: { directory: project },
+      })
+      await settle()
+    },
+  }
 
   const context = {
     location: { directory },
@@ -134,8 +156,14 @@ async function serverHalf(directory: string) {
       },
       // no assistant turn is reported for these sessions: nothing is attributed
       context: async () => [],
-      // session lookup for location-less turn events
-      get: async (input: { sessionID: string }) => ({ directory, parentID: undefined }),
+      // session lookup for location-less turn events. The directory is only ever
+      // under `location`: eight live `session.get` results across four recordings
+      // all reported `hasTopLevelDirectory: false`, and the flat shape this used
+      // to return was the reason a dead branch survived in the adapter.
+      get: async (input: { sessionID: string }) => {
+        getCalls.push(input.sessionID)
+        return { location: { directory }, parentID: undefined }
+      },
     },
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => ({
@@ -184,14 +212,79 @@ async function serverHalf(directory: string) {
       await settle()
     },
     /**
+     * Emit one `session.inbox.enqueued` — the wake source a waiting goal is told
+     * to arrange. Shaped as the recordings shaped it: a `location`, and an item
+     * tagged `user`.
+     */
+    inboxArrived: async (sessionID: string, text: string, itemType = 'user'): Promise<void> => {
+      await inbox.push(sessionID, text, itemType, directory)
+    },
+    /** The same event, reported for a session in another project. */
+    inboxArrivedIn: async (sessionID: string, text: string, project: string): Promise<void> => {
+      await inbox.push(sessionID, text, 'user', project)
+    },
+    /**
      * Emit the turn-completion event opencode 2.x actually publishes —
      * `session.execution.succeeded|failed|interrupted`, with no location —
      * and wait for the driver to finish.
      */
-    turnFinished: async (sessionID: string, outcome: 'succeeded' | 'failed' | 'interrupted' = 'succeeded', reason?: string): Promise<void> => {
+    turnFinished: async (
+      sessionID: string,
+      outcome: 'succeeded' | 'failed' | 'interrupted' = 'succeeded',
+      reason?: string,
+      error?: { type: string; message: string; status?: number },
+    ): Promise<void> => {
+      const data: Record<string, unknown> = { sessionID }
+      if (reason !== undefined) data.reason = reason
+      if (error !== undefined) data.error = error
+      queue.push({ type: `session.execution.${outcome}`, data })
+      await settle()
+    },
+    /** Every session id the adapter looked up through `session.get`. */
+    get lookups(): readonly string[] {
+      return getCalls
+    },
+    /**
+     * Emit one `session.step.started` — the durable, location-bearing event that
+     * teaches the adapter a session's project directory — and wait.
+     */
+    stepStarted: async (sessionID: string, sessionDirectory?: string): Promise<void> => {
       queue.push({
-        type: `session.execution.${outcome}`,
-        data: reason === undefined ? { sessionID } : { sessionID, reason },
+        type: 'session.step.started',
+        data: { sessionID, assistantMessageID: `msg-${sessionID}` },
+        location: { directory: sessionDirectory ?? directory },
+      })
+      await settle()
+    },
+    /**
+     * Emit one `session.tool.called` — a goal turn that acted. A turn with no tool
+     * call at all is a goal talking without acting, and the second stall counter
+     * stops it, so a test simulating a working loop has to say so.
+     */
+    toolCalled: async (sessionID: string, id: string): Promise<void> => {
+      queue.push({
+        type: 'session.tool.called',
+        data: { sessionID, assistantMessageID: `msg-${sessionID}`, id, input: { command: 'ls' }, executed: true },
+        location: { directory },
+      })
+      await settle()
+    },
+    /**
+     * Emit one `session.tool.success` for a command that actually ran. Shaped as
+     * the live bash example was shaped: `metadata` carries `status` and `exit`.
+     */
+    commandRan: async (sessionID: string, id: string, exit: number): Promise<void> => {
+      queue.push({
+        type: 'session.tool.success',
+        data: {
+          sessionID,
+          assistantMessageID: `msg-${sessionID}`,
+          id,
+          content: [{ type: 'text', text: `Command exited with code ${exit}.` }],
+          metadata: { status: 'completed', truncated: false, exit },
+          executed: false,
+        },
+        location: { directory },
       })
       await settle()
     },
@@ -217,6 +310,333 @@ describe('server plugin definition', () => {
     expect(typeof OpenCodeGoalPlugin).toBe('object')
     expect(OpenCodeGoalPlugin.id).toBe('opencode-goal')
     expect(typeof OpenCodeGoalPlugin.setup).toBe('function')
+  })
+})
+
+describe('the trigger layer attributes a location-less turn without a lookup', () => {
+  test('a step-started teaches the directory, so the completion event needs no lookup', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-trigger-step-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('trigger objective')
+
+      // a session this server never saw created: its turn is already running
+      expect(server.lookups.length).toBe(0)
+
+      // the step-started event carries the directory
+      await server.stepStarted('ses-trigger')
+      expect(server.lookups.length).toBe(0)
+
+      // so the location-less completion event is attributed from the map
+      await server.turnFinished('ses-trigger')
+      expect(server.prompts.length).toBe(1)
+      expect(server.prompts[0].text).toContain('round 2/25')
+      // and no session lookup was made at any point
+      expect(server.lookups.length).toBe(0)
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a session with no step-started still resolves through the narrowed lookup', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-trigger-lookup-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('lookup objective')
+
+      // no step-started, no created: the map has nothing for this session
+      await server.turnFinished('ses-unknown')
+      expect(server.lookups).toEqual(['ses-unknown'])
+      expect(server.prompts.length).toBe(1)
+      expect(server.prompts[0].text).toContain('round 2/25')
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("another project's step-started does not drive this project's goal", async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-trigger-other-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('ownership objective')
+
+      await server.stepStarted('ses-elsewhere', '/some/other/project')
+      await server.turnFinished('ses-elsewhere')
+      expect(server.prompts.length).toBe(0)
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('a completion claim is cross-checked against the event stream', () => {
+  const CLAIM = {
+    summary: 'the parser handles escaped separators',
+    criteria: [{ criterion: 'escaped separators do not split a field', evidence: ['bun test passed: 41 tests'] }],
+    checks: [{ command: 'bun test', result: 'passed', exitCode: 0 }],
+  }
+
+  test('a command that actually ran backs the claim, end to end', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-claim-run-'))
+    try {
+      const server = await serverHalf(directory)
+      await server.tool('create_goal').execute({ objective: 'claim objective' }, {} as never)
+      await server.stepStarted('ses-claim')
+
+      // the model runs the command; the event stream records that it ran
+      await server.commandRan('ses-claim', 'call-1', 0)
+
+      const result = JSON.parse(
+        (
+          await server.tool('update_goal').execute({ action: 'complete', claim: CLAIM }, {} as never)
+        ).content as string,
+      )
+      expect(result.goal.phase).toBe('complete')
+      // ...and the claim and the events agree
+      expect(result.crossCheck[0].agrees).toBe(true)
+      expect(result.warning).toBeUndefined()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a claim about a command that never ran is visible as a disagreement', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-claim-norun-'))
+    try {
+      const server = await serverHalf(directory)
+      await server.tool('create_goal').execute({ objective: 'claim objective' }, {} as never)
+      await server.stepStarted('ses-claim2')
+
+      // nothing ran, but the model claims it did
+      const result = JSON.parse(
+        (
+          await server.tool('update_goal').execute({ action: 'complete', claim: CLAIM }, {} as never)
+        ).content as string,
+      )
+      expect(result.goal.phase).toBe('complete')
+      expect(result.crossCheck[0].agrees).toBe(false)
+      expect(result.crossCheck[0].ranNothing).toBe(true)
+      expect(result.warning).toContain('No command is recorded as having run')
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a claim about a different exit code than the one that ran disagrees', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-claim-wrongexit-'))
+    try {
+      const server = await serverHalf(directory)
+      await server.tool('create_goal').execute({ objective: 'claim objective' }, {} as never)
+      await server.stepStarted('ses-claim3')
+
+      // the command ran and failed, but the claim says it passed
+      await server.commandRan('ses-claim3', 'call-2', 1)
+      const result = JSON.parse(
+        (
+          await server.tool('update_goal').execute({ action: 'complete', claim: CLAIM }, {} as never)
+        ).content as string,
+      )
+      expect(result.crossCheck[0].agrees).toBe(false)
+      expect(result.warning).toBeUndefined()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('the external wait is durable and woken by a human', () => {
+  test('a wait survives a restart, so the goal is still waiting after it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-wait-durable-'))
+    try {
+      const first = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('waiting objective')
+      await first.stepStarted('ses-wait')
+      const store = new GoalStore(directory)
+      const ref = { id: store.view()!.id, revision: store.view()!.revision }
+      store.wait(ref, 'waiting for the platform review', 60_000)
+
+      // a restart
+      const second = await serverHalf(directory)
+      const restarted = new GoalStore(directory)
+      expect(restarted.waitUntil).toBeGreaterThan(Date.now())
+      expect(restarted.waitReason).toBe('waiting for the platform review')
+      // and it is still suppressed: no round was admitted on the fresh process
+      const before = second.prompts.length
+      await second.idle('ses-wait-again')
+      expect(second.prompts.length).toBe(before)
+
+      tui.cleanup()
+      await first.cleanup()
+      await second.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a human arriving ends the wait and arms the goal for its next round', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-wait-wake-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('waiting objective')
+      await server.stepStarted('ses-wake')
+      const store = new GoalStore(directory)
+      store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
+
+      // suppressed while the wait stands: the command plane's own first kick is
+      // the only prompt there is, and the driver admits nothing on top of it
+      await server.idle('ses-wake')
+      expect(tui.prompts.length).toBe(1)
+      expect(server.prompts.length).toBe(0)
+
+      // a human sends a message: the wait ends, durably
+      await server.inboxArrived('ses-wake', 'the review is done, carry on')
+      const after = new GoalStore(directory).view()!
+      expect(after.waitUntil).toBe(0)
+      expect(after.waitReason).toBeUndefined()
+
+      // and the goal is armed, so when this human's own turn finishes the next
+      // round is admitted rather than reported disarmed
+      expect(after.phase).toBe('active')
+      await server.turnFinished('ses-wake')
+      expect(server.prompts.length).toBe(1)
+      expect(server.prompts[0].text).toContain('round 2/25')
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("another project's inbox item does not end this project's wait", async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-wait-other-'))
+    const other = mkdtempSync(join(tmpdir(), 'goal-wait-other-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('waiting objective')
+      await server.stepStarted('ses-other')
+      const store = new GoalStore(directory)
+      store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting', 60_000)
+
+      // a human arriving in a different project
+      await server.inboxArrivedIn('ses-other', 'a human in another project', other)
+      await settle()
+      const after = new GoalStore(directory).view()!
+      expect(after.waitUntil).toBeGreaterThan(0)
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+      rmSync(other, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('a provider refusal stops the goal durably', () => {
+  /** The recorded live payload: a 403 from a provider demanding a subscription. */
+  const REFUSAL = {
+    type: 'provider.auth',
+    message: 'Upstream request failed: An active OpenCode Go subscription is required to use Go models.',
+    status: 403,
+  }
+
+  test('a refused turn blocks the goal with the provider as the reason', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-stops-refused-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('refused objective')
+      await server.stepStarted('ses-refused')
+
+      // the turn fails with the provider's structured refusal
+      await server.turnFinished('ses-refused', 'failed', undefined, REFUSAL)
+
+      // the goal is durably blocked, and the reason says the provider
+      const store = new GoalStore(directory)
+      const view = store.view()!
+      expect(view.phase).toBe('blocked')
+      expect(view.blockedReason?.code).toBe('usage-limited')
+      expect(view.blockedReason?.message).toContain('HTTP 403')
+      // round 1 was the command plane's own kick; the server admitted nothing
+      expect(tui.prompts.length).toBe(1)
+      expect(server.prompts.length).toBe(0)
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a transient failure does not stop the goal', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-stops-transient-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('transient objective')
+      await server.stepStarted('ses-transient')
+
+      // a 500 is retryable; stopping the goal would lose the next attempt's work
+      await server.toolCalled('ses-transient', 'call-transient')
+      await server.turnFinished('ses-transient', 'failed', undefined, {
+        type: 'server',
+        message: 'internal error',
+        status: 500,
+      })
+
+      const store = new GoalStore(directory)
+      expect(store.view()!.phase).toBe('active')
+      // and the loop keeps going on the next completion
+      await server.toolCalled('ses-transient', 'call-transient-2')
+      await server.turnFinished('ses-transient')
+      expect(server.prompts.length).toBe(2)
+      expect(server.prompts[1].text).toContain('round 3/25')
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a stop survives a restart instead of being re-armed into the same refusal', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-stops-restart-'))
+    try {
+      const first = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('restart objective')
+      await first.stepStarted('ses-restart')
+      await first.turnFinished('ses-restart', 'failed', undefined, REFUSAL)
+      tui.cleanup()
+      await first.cleanup()
+
+      // a fresh server process reads the same log: the goal is still stopped,
+      // and nothing re-arms it back into the refusal that stopped it
+      const second = await serverHalf(directory)
+      await second.created('ses-restart-again')
+      expect(second.prompts.length).toBe(0)
+      expect(new GoalStore(directory).view()!.blockedReason?.code).toBe('usage-limited')
+
+      await second.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })
 
@@ -300,7 +720,7 @@ describe('TUI command plane + server driver', () => {
     }
   })
 
-  test('a goal that only survived a restart auto-starts when a session opens', async () => {
+  test('a goal that only survived a restart auto-starts when a session opens', { timeout: 30_000 }, async () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-integration-restart-'))
     try {
       // yesterday: a goal was created and left active
@@ -325,6 +745,7 @@ describe('TUI command plane + server driver', () => {
       // arriving mid-round cannot admit a second one
       await server.idle('ses-restart')
       expect(server.prompts.length).toBe(1)
+      await server.toolCalled('ses-restart', 'call-restart')
       await server.turnFinished('ses-restart')
       expect(server.prompts.length).toBe(2)
       expect(server.prompts[1].text).toContain('round 2/25')
@@ -335,6 +756,7 @@ describe('TUI command plane + server driver', () => {
 
       // the round finishes: round 3 runs, and a list-shaped creation payload
       // for another session defers the same way
+      await server.toolCalled('ses-restart', 'call-restart-2')
       await server.turnFinished('ses-restart')
       expect(server.prompts.length).toBe(3)
       expect(server.prompts[2].text).toContain('round 3/25')
@@ -356,7 +778,10 @@ describe('TUI command plane + server driver', () => {
     }
   })
 
-  test('the autonomous loop advances round after round on turn completion', async () => {
+  // Slow, not hung: the plugin's event stream polls at 1ms in a tight loop, which
+  // starves the harness's millisecond-scale settle timers. The behaviour is not
+  // the reason for the time.
+  test('the autonomous loop advances round after round on turn completion', { timeout: 30_000 }, async () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-integration-loop-'))
     try {
       const server = await serverHalf(directory)
@@ -366,16 +791,19 @@ describe('TUI command plane + server driver', () => {
       // each finished turn admits exactly one more round, with no human input
       expect(server.prompts.length).toBe(1)
       for (const round of [1, 2, 3]) {
+        await server.toolCalled('ses-loop', `call-${round}`)
         await server.turnFinished('ses-loop')
         expect(server.prompts.length).toBe(round + 1)
         expect(server.prompts[round].text).toContain(`round ${round + 1}/25`)
       }
 
       // a failed turn keeps the loop going; an interrupted-by-user turn does not
+      await server.toolCalled('ses-loop', 'call-4')
       await server.turnFinished('ses-loop', 'failed')
       expect(server.prompts.length).toBe(5)
       await server.turnFinished('ses-loop', 'interrupted', 'user')
       expect(server.prompts.length).toBe(5)
+      await server.toolCalled('ses-loop', 'call-5')
       await server.turnFinished('ses-loop')
       expect(server.prompts.length).toBe(6)
 
@@ -388,7 +816,7 @@ describe('TUI command plane + server driver', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }
-  })
+  }), 30_000
 
   test('another project\'s session events do not drive this project\'s goal', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-integration-own-'))

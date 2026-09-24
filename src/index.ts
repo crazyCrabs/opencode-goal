@@ -18,6 +18,14 @@
  * resume), and `session.deleted` forgets the session. The legacy
  * `session.idle` is still honored while no round is in flight.
  *
+ * Usage accounting runs on four more: `session.step.ended` folds the step's
+ * token and cost delta, `session.text.ended` buffers the assistant text the
+ * no-progress guard reads, and `session.tool.called`/`session.tool.success`
+ * reset that guard because the goal acted. All four are durable and all four
+ * carry a location; `session.usage.updated` is deliberately not among them
+ * because it is ephemeral and carries no location, and folding it into a
+ * durable counter under-counts after a restart.
+ *
  * Events carry no project directory on the execution family, and a server
  * loads this plugin once per location, so every instance sees every project's
  * events: each event is therefore resolved to its session's directory (from
@@ -34,6 +42,7 @@
  */
 
 import type { Plugin } from '@opencode/plugin'
+import { GoalAccounting } from './accounting.ts'
 import { GoalDriver } from './driver.ts'
 import { GoalStore } from './state.ts'
 import { goalTools } from './tools.ts'
@@ -81,6 +90,23 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     }
 
     /**
+     * The session events that carry NO location, enumerated in one place because
+     * the answer is not obvious and has to be right. Verified against four live
+     * recordings: every other event in the `session.*` family carries one.
+     *
+     * `session.execution.interrupted` is in this set by family rather than by
+     * observation — it never appeared in a recording, but its three siblings all
+     * carry no location, and treating it as the exception would be the guess.
+     */
+    const LOCATION_LESS_EVENTS: ReadonlySet<string> = new Set([
+      'session.execution.started',
+      'session.execution.succeeded',
+      'session.execution.failed',
+      'session.execution.interrupted',
+      'session.usage.updated',
+    ])
+
+    /**
      * Remember one session's project directory and whether it is a subagent
      * session, so later location-less events can be attributed correctly.
      */
@@ -92,8 +118,18 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     /**
      * Resolve the directory a session's turn belongs to, or undefined when it
      * belongs to another project (another plugin instance drives it there) or
-     * is a subagent session. Falls back to a session lookup for sessions this
-     * process never saw created — a session reopened after a restart.
+     * is a subagent session.
+     *
+     * The directory comes from the map, which `session.created` and
+     * `session.step.started` fill from their locations — step-started fires at the
+     * start of every step and always precedes the completion event of the same
+     * session, so a location-less completion event never needs a lookup to be
+     * attributed. No per-turn API call is made.
+     *
+     * The lookup remains for exactly one job no event can do: telling a subagent
+     * session from a root one, for a session this process never saw created
+     * (one whose turn was already running when this process came alive). It also
+     * happens to return the directory, which is remembered.
      */
     const resolveTurnSession = async (
       sessionID: string,
@@ -103,16 +139,17 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
       let directory = sessionDirectories.get(sessionID)
       if (directory === undefined) {
         try {
-          // the plugin's session.get returns the session info; the directory
-          // has been seen both at the top level and under `location`
+          // The session info carries the directory only under `location`. The
+          // flat top-level shape this used to read first was verified absent in
+          // four live recordings — `hasTopLevelDirectory: false` in every one —
+          // so reading it was reading a field that never exists.
           const info = (await ctx.session.get({ sessionID })) as
-            | { directory?: string; parentID?: string; location?: { directory?: string } }
+            | { parentID?: string; location?: { directory?: string } }
             | undefined
           if (info === undefined) return undefined
-          const infoDirectory = info.directory ?? info.location?.directory
-          rememberSession(sessionID, infoDirectory, info.parentID)
+          rememberSession(sessionID, info.location?.directory, info.parentID)
           if (childSessions.has(sessionID)) return undefined
-          directory = infoDirectory
+          directory = info.location?.directory
         } catch {
           return undefined // a failed lookup is retried on the next event
         }
@@ -129,6 +166,21 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     })
     driver.setDirectory(root)
 
+    //
+    // Usage accounting: its own module, folding the durable session events as
+    // they arrive rather than reading the transcript at turn completion. The
+    // fold runs before the turn-completion event the driver acts on, so a
+    // guardrail checked at admission sees the usage the turn actually spent.
+    //
+    // It is built after the driver because it asks the driver which turns are the
+    // goal's own, and the driver is the only writer that can answer: it is the
+    // one that submitted the prompt that started the turn.
+    //
+    const accounting = new GoalAccounting({
+      storeFor: getStore,
+      isGoalTurn: sessionID => driver.isGoalTurn(sessionID),
+    })
+
     // Materialize the root store now: a store that already exists observes later
     // external mutations (e.g. a `/goal` create from the TUI command plane) as
     // changes and arms the driver. A store created lazily after such a mutation
@@ -138,7 +190,7 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     log('plugin initialized', { root })
 
     // Goal tools (`get_goal`, `create_goal`, `update_goal`, `goal_wait`).
-    const tools = goalTools(root, getStore)
+    const tools = goalTools(root, getStore, directory => accounting.commandsFor(directory))
     const toolRegistration = await ctx.tool.transform((editor) => {
       for (const tool of tools) editor.add(tool)
     })
@@ -156,7 +208,7 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
         type: 'text',
         text: [
           `[opencode-goal] Active goal (round ${goal.roundsStarted + 1}/${goal.maxGoalRounds}${budget}): ${goal.objective}`,
-          'Keep working toward this objective across turns. Call get_goal to inspect it, update_goal(action="complete") with evidence when achieved, update_goal(action="blocked") for a true impasse, or goal_wait while waiting on external events.',
+          'Keep working toward this objective across turns. Call get_goal to inspect it, update_goal(action="complete") with a structured claim when achieved, update_goal(action="blocked") for a true impasse, or goal_wait while waiting on external events. Mutations resolve the goal themselves, so you never quote an id or a revision.',
         ].join('\n'),
       })
     })
@@ -169,6 +221,23 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          //
+          // The location-less set above is load-bearing in exactly one way: it is
+          // checked against reality. An event the recordings said carries a
+          // location arriving without one, or the reverse, means the server
+          // changed shape, and the symptom would be a silent fall back to a
+          // per-turn lookup rather than an error.
+          //
+          if (event.type.startsWith('session.')) {
+            const carriesLocation = event.location !== undefined && event.location !== null
+            if (LOCATION_LESS_EVENTS.has(event.type) === carriesLocation) {
+              log('session event location shape differs from the recorded one', {
+                type: event.type,
+                carriesLocation,
+                expectedLocationLess: LOCATION_LESS_EVENTS.has(event.type),
+              })
+            }
+          }
           if (event.type === 'session.idle') {
             // legacy completion signal: honored only while no round is in
             // flight, because 2.x can emit it without any turn finishing
@@ -202,16 +271,106 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
             const sessionID = event.data.sessionID
             if (sessionID === undefined) continue
             const reason = event.type === 'session.execution.interrupted' ? event.data.reason : undefined
+            // a failed turn carries the provider's structured refusal
+            // (`{ type, message, status? }`, declared by `@opencode/protocol` and
+            // confirmed by a live 403), which is what stops the goal durably
+            // rather than leaving it disarmed and silently quiet
+            const error = event.type === 'session.execution.failed' ? event.data.error : undefined
             void (async () => {
               const directory = await resolveTurnSession(sessionID, event.location?.directory)
-              if (directory !== undefined) await driver.onTurnFinished(sessionID, directory, reason)
+              if (directory === undefined) return
+              // Both stall counters are decided here, before the driver's own
+              // completion handler, so a guardrail checked at admission sees the
+              // counters the turn that just ended actually produced.
+              accounting.onTurnEnded(directory, sessionID)
+              await driver.onTurnFinished(sessionID, directory, reason, error, event.durable?.seq)
             })()
+          } else if (event.type === 'session.step.started') {
+            //
+            // Learn the session's project directory here, from an event that
+            // carries one. Step-started fires at the start of every step and
+            // always precedes the completion event of the same session, so the
+            // location-less completion events are attributed from the map
+            // rather than from a per-turn lookup.
+            //
+            const sessionID = event.data.sessionID
+            if (sessionID === undefined) continue
+            const stepDirectory = event.location?.directory
+            if (stepDirectory !== undefined && stepDirectory.length > 0) {
+              // remember only the subagent question here: a step-started carries
+              // no parentID, so this records the directory and leaves the
+              // subagent answer to whatever already decided it
+              sessionDirectories.set(sessionID, stepDirectory)
+            }
           } else if (event.type === 'session.deleted') {
             const sessionID = event.data.sessionID
             if (sessionID === undefined) continue
             sessionDirectories.delete(sessionID)
             childSessions.delete(sessionID)
             driver.forget(sessionID)
+            accounting.forget(sessionID)
+          } else if (
+            event.type === 'session.step.ended' ||
+            event.type === 'session.text.ended' ||
+            event.type === 'session.tool.called' ||
+            event.type === 'session.tool.success'
+          ) {
+            //
+            // The durable accounting events. Unlike the execution events these
+            // all carry a location, so the directory needs no lookup; the
+            // resolver is still used for what only it can answer, which is
+            // whether the session is a subagent's and whether this instance
+            // owns the directory.
+            //
+            const sessionID = event.data.sessionID
+            if (sessionID === undefined) continue
+            const directory = await resolveTurnSession(sessionID, event.location?.directory)
+            if (directory === undefined) continue
+            if (event.type === 'session.step.ended') {
+              accounting.onStepEnded(directory, event.data, event.durable?.seq)
+            } else if (event.type === 'session.text.ended') {
+              accounting.onTextEnded(directory, event.data)
+            } else if (event.type === 'session.tool.success') {
+              // A success is both a signal that the goal acted and, when its
+              // metadata carries an `exit`, a command that actually ran — the
+              // fact a completion claim is cross-checked against.
+              accounting.onToolActivity(directory, sessionID)
+              accounting.onToolSuccess(directory, event.data)
+            } else {
+              accounting.onToolActivity(directory, sessionID)
+            }
+          } else if (event.type === 'session.inbox.enqueued') {
+            //
+            // A human arriving ends an external wait. This is the wake source a
+            // waiting goal was told to arrange, and it is the reason the wait can
+            // be durable at all: the goal no longer has to be awake to hear it.
+            //
+            // Distinguishing a human's item from the goal's own continuation
+            // prompt is free, in two independent ways. `item.type` is a tagged
+            // union — `user`, `synthetic`, `compaction`, `move` — so a human is
+            // named outright. And structurally, while a goal is waiting admission
+            // is suppressed, so the plugin submits no continuation prompt, so no
+            // goal-originated inbox item can arrive during a wait at all. Either
+            // fact alone would do; the second is what makes the first redundant
+            // rather than the other way round.
+            //
+            const sessionID = event.data.sessionID
+            if (sessionID === undefined) continue
+            const directory = event.location?.directory
+            if (directory === undefined || directory.length === 0) continue
+            if (childSessions.has(sessionID)) continue
+            if (!ownsDirectory(directory)) continue
+            const store = getStore(directory)
+            const goal = store.view()
+            if (goal === undefined || goal.waitUntil === 0) continue
+            // Arming here is what lets the arriving turn drive the next round:
+            // the goal is active and armed, so when this human's own turn
+            // finishes, admission admits a round rather than reporting
+            // `disarmed`. A store that never mutated the goal stays disarmed, and
+            // this event is that mutation.
+            store.activation = 'armed'
+            store.endWait({ id: goal.id, revision: goal.revision })
+            log('goal wait ended by a human arriving', { goalID: goal.id, directory })
           }
         }
       } catch {

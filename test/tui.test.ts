@@ -58,7 +58,10 @@ afterEach(() => {
  * `route` stands in for the TUI's current route: a `session` route carries the
  * session that can execute a goal round, anything else leaves it without one.
  */
-function makeContext(directory: string, route: TuiRouteRef = { type: 'session', sessionID: 'ses-goal' }) {
+function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'session', sessionID: 'ses-goal' }) {
+  // The route is mutable so a test can model the user navigating from the home
+  // route into a session, which is the moment the auto-start has to notice.
+  const holder = { route: initialRoute }
   const toasts: Toast[] = []
   const prompts: Array<{ sessionID: string; text: string }> = []
   const slots: SlotClaim[] = []
@@ -104,7 +107,10 @@ function makeContext(directory: string, route: TuiRouteRef = { type: 'session', 
         alert: async () => {},
         clear: () => {},
       },
-      router: { current: () => route },
+      router: { current: () => holder.route },
+      setRoute: (next: TuiRouteRef) => {
+        holder.route = next
+      },
       slot: claim => slots.push(claim),
     },
   }
@@ -402,5 +408,80 @@ describe('tui goal command plane', () => {
     expect(mock.unsubscribed()).toBe(false)
     cleanups.pop()?.()
     expect(mock.unsubscribed()).toBe(true)
+  })
+})
+
+describe('an armed goal starts itself when a session opens', () => {
+  /** A harness whose sidebar poll actually runs, at a 1ms cadence. */
+  function polling(route: TuiRouteRef): Mock {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-tui-auto-'))
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
+    const harness = makeContext(directory, route)
+    const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 1 }).setup(harness.context)
+    cleanups.push(cleanup)
+    harness.slots.find(claim => claim.append === 'app')?.render({})
+    return {
+      directory,
+      context: harness.context,
+      toasts: harness.toasts,
+      prompts: harness.prompts,
+      slots: harness.slots,
+      confirms: harness.confirms,
+      objectivePrompts: harness.objectivePrompts,
+      layers: harness.layers,
+      state: harness.state,
+      mountKeymapLayer: () => {},
+      slot: (append: string) => harness.slots.find(claim => claim.append === append),
+      command: (id: string) => (harness.layers[0]?.commands ?? []).find(command => command.id === id)!,
+      unsubscribed: () => harness.unsubscribed(),
+    }
+  }
+
+  /** Let the poll run a few times. */
+  async function ticks(count = 5): Promise<void> {
+    for (let i = 0; i < count; i++) await new Promise(resolve => setTimeout(resolve, 4))
+  }
+
+  test('a goal created with no session open starts when one is opened', async () => {
+    // The reported defect: `/goal create` from the home route has no session to
+    // run in, so the command plane showed a hint and admitted nothing. Opening a
+    // session then had to start it, and nothing reacted to that.
+    const home = { type: 'home' } as TuiRouteRef
+    const harness = polling(home)
+    try {
+      // create the goal through the command plane, so it is created by the same
+      // store instance the plugin polls — a store that came alive beside an
+      // existing goal reads as disarmed, which is correct and is also why the
+      // auto-start must not fire for one
+      await harness.command('goal.command').run!('auto objective')
+      harness.prompts.length = 0
+      await ticks()
+      expect(harness.prompts.length).toBe(0) // no session yet: nothing to run in
+
+      // the user opens a session
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-auto',
+      })
+
+      await ticks()
+      expect(harness.prompts.length).toBe(1) // it started on its own
+      expect(harness.prompts[0].sessionID).toBe('ses-auto')
+      expect(harness.prompts[0].text).toContain('round 1/25')
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('it starts once, not once per poll', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-once' })
+    try {
+      await harness.command('goal.command').run!('once objective')
+      harness.prompts.length = 0
+      await ticks(20)
+      expect(harness.prompts.length).toBe(1)
+    } finally {
+      // handled by cleanups
+    }
   })
 })

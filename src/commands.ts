@@ -7,7 +7,7 @@
  * is spent on goal control.
  */
 
-import type { GoalStore } from './state.ts'
+import { GoalStore } from './state.ts'
 import { GoalError, type GoalRef, type GoalView } from './types.ts'
 
 const USAGE = 'Usage: /goal [<objective>|status|edit <objective>|pause|resume|clear] | /goal --tokens <n> <objective> | /goal --rounds <n> <objective>'
@@ -141,7 +141,11 @@ export function executeGoalCommand(store: GoalStore, command: ParsedGoalCommand)
         if (current !== undefined && current.phase !== 'complete') {
           return fail(`A goal is already ${phaseLabel(current.phase)}. Use /goal edit <objective> to change it or /goal clear before replacing it.`)
         }
-        const view = store.create(objective, command.maxGoalRounds ?? 25, command.tokenBudget ?? 0)
+        const view = store.create(
+          objective,
+          command.maxGoalRounds ?? GoalStore.DEFAULT_MAX_GOAL_ROUNDS,
+          command.tokenBudget ?? 0,
+        )
         return ok(renderGoal('Goal created (armed, autonomous continuation enabled)', view))
       }
       case 'edit': {

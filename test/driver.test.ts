@@ -3,7 +3,8 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GoalStore } from '../src/state.ts'
-import { GoalDriver, renderGoalRoundPrompt } from '../src/driver.ts'
+import { GoalAccounting, type StepEndedData } from '../src/accounting.ts'
+import { GoalDriver } from '../src/driver.ts'
 
 let dir = ''
 let store: GoalStore
@@ -12,47 +13,52 @@ const promptCalls: Array<{ sessionID: string; text: string }> = []
 
 /**
  * The slice of the opencode 2.x session domain the driver speaks to: a flat
- * `{ sessionID, text }` prompt, a transcript read, and a session lookup. Usage
- * and round output are attributed from the transcript — opencode 2.x no longer
- * emits `message.updated` — so the mock carries one finished assistant turn.
+ * `{ sessionID, text }` prompt. Usage and round output are no longer read here
+ * — the accounting module folds them from the durable session events, so the
+ * driver's only transport concern is submitting a round.
  */
-const transcript = [
-  {
-    id: 'msg-driver-1',
-    type: 'assistant',
-    tokens: { input: 100, output: 50 },
-    cost: 0.001,
-    content: [{ type: 'text', text: 'work done for this round' }],
-  },
-]
-
 const session = {
   prompt: async (input: { sessionID: string; text: string }) => {
     promptCalls.push({ sessionID: input.sessionID, text: input.text })
     if (releasePrompt !== undefined) await new Promise<void>(resolve => { releasePrompt = resolve })
     return {}
   },
-  context: async () => transcript,
-  get: async (input: { sessionID: string }) => ({ directory: dir, parentID: undefined }),
+}
+
+/** One finished step, as a live server reports it. */
+const STEP: StepEndedData = {
+  sessionID: 'ses-driver',
+  assistantMessageID: 'msg-driver-1',
+  finish: 'stop',
+  cost: 0,
+  tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
 }
 
 /** When set, a submitted round prompt parks until this releases it. */
 let releasePrompt: (() => void) | undefined
 
-function makeDriver(st: GoalStore): GoalDriver {
+/**
+ * Build a driver together with the accounting that feeds it, because a round's
+ * guardrails are checked at admission and the usage they check is folded from
+ * the durable events that arrive before the turn-completion event. Both halves
+ * are wired the way the plugin wires them: one store per directory, accounting
+ * first.
+ */
+function makeDriver(st: GoalStore, directory: string): { driver: GoalDriver; accounting: GoalAccounting } {
+  const accounting = new GoalAccounting({ storeFor: () => st, isGoalTurn: () => true })
   const d = new GoalDriver({
     getStore: () => st,
     session,
     log: () => {},
   })
-  d.setDirectory(dir)
-  return d
+  d.setDirectory(directory)
+  return { driver: d, accounting }
 }
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'goal-driver-'))
   store = new GoalStore(dir)
-  driver = makeDriver(store)
+  driver = makeDriver(store, dir).driver
 })
 
 describe('continuation driver', () => {
@@ -66,12 +72,11 @@ describe('continuation driver', () => {
     expect(promptCalls[before].text).toContain('round 1/5')
     expect(store.current?.roundsStarted).toBe(1)
     expect(store.current?.revision).toBe(2)
-    expect(store.view()?.usage.inputTokens).toBe(100)
   })
 
   test('round cap blocks the goal with round-limit', async () => {
     const capped = new GoalStore(mkdtempSync(join(tmpdir(), 'goal-driver-cap-')))
-    const driver2 = makeDriver(capped)
+    const { driver: driver2 } = makeDriver(capped, dir)
     capped.create('tiny goal', 1, 0)
     await driver2.onSessionIdle('session-2', dir)
     await driver2.onTurnFinished('session-2', dir)
@@ -81,18 +86,20 @@ describe('continuation driver', () => {
 
   test('token budget blocks with budget-limited on the next finished turn', async () => {
     const budgeted = new GoalStore(mkdtempSync(join(tmpdir(), 'goal-driver-budget-')))
-    const driver3 = makeDriver(budgeted)
+    const { driver: driver3, accounting } = makeDriver(budgeted, dir)
     budgeted.create('budget goal', 25, 10)
     await driver3.onSessionIdle('session-3', dir) // round 1 admitted
-    await driver3.onTurnFinished('session-3', dir) // the finished turn already spent 100 >= 10
-    await driver3.onTurnFinished('session-3', dir) // the guardrail has fired, nothing is admitted
+    // the turn's durable step event folds the usage, exactly as the plugin wires
+    // it — the accounting runs before the completion event the driver acts on
+    accounting.onStepEnded(dir, STEP)
+    await driver3.onTurnFinished('session-3', dir) // 100 >= 10, so the guardrail fires
     expect(budgeted.current?.phase).toBe('blocked')
     expect(budgeted.current?.blockedReason?.code).toBe('budget-limited')
   })
 
   test('paused or disarmed goals are never continued', async () => {
     const quiet = new GoalStore(mkdtempSync(join(tmpdir(), 'goal-driver-quiet-')))
-    const driver4 = makeDriver(quiet)
+    const { driver: driver4 } = makeDriver(quiet, dir)
     quiet.create('quiet goal', 25, 0)
     quiet.activation = 'disarmed'
     const before = promptCalls.length
@@ -103,18 +110,27 @@ describe('continuation driver', () => {
     expect(promptCalls.length).toBe(before)
   })
 
-  test('wait suppresses continuation until the deadline', async () => {
-    const waiting = new GoalStore(mkdtempSync(join(tmpdir(), 'goal-driver-wait-')))
-    const driver5 = makeDriver(waiting)
+  test('wait suppresses continuation, and a fresh process is suppressed by the same deadline', async () => {
+    const waitingDir = mkdtempSync(join(tmpdir(), 'goal-driver-wait-'))
+    const waiting = new GoalStore(waitingDir)
+    const { driver: driver5 } = makeDriver(waiting, waitingDir)
     waiting.create('wait goal', 25, 0)
     waiting.wait({ id: waiting.current!.id, revision: waiting.current!.revision }, 'waiting for CI', 60_000)
     const before = promptCalls.length
-    await driver5.onSessionIdle('session-5', dir)
+    await driver5.onSessionIdle('session-5', waitingDir)
     expect(promptCalls.length).toBe(before)
-    // expired deadline allows continuation
-    waiting.waitUntil = Date.now() - 1000
-    await driver5.onSessionIdle('session-5', dir)
-    expect(promptCalls.length).toBe(before + 1)
+
+    // The wait is durable, so this is the state a restart finds: a store that came
+    // alive beside a waiting goal reads the same deadline and stays quiet. It used
+    // to read nothing, find the goal armed, and run straight on into whatever the
+    // goal had been waiting for.
+    const restarted = new GoalStore(waitingDir)
+    restarted.sync()
+    expect(restarted.waitUntil).toBeGreaterThan(Date.now())
+    expect(restarted.view()!.phase).toBe('active')
+    const after = promptCalls.length
+    await driver5.onSessionIdle('session-5', waitingDir)
+    expect(promptCalls.length).toBe(after)
   })
 })
 
@@ -129,7 +145,7 @@ describe('a session opening adopts the goal', () => {
     // the exact posture that used to require a manual /goal resume
     const today = new GoalStore(directory)
     expect(today.view()?.activation).toBe('disarmed')
-    const adopted = makeDriver(today)
+    const { driver: adopted } = makeDriver(today, directory)
 
     // an idle with no session activity stays quiet
     const before = promptCalls.length
@@ -160,7 +176,7 @@ describe('a session opening adopts the goal', () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-driver-inflight-'))
     const store = new GoalStore(directory)
     store.create('inflight objective', 5, 0)
-    const driver = makeDriver(store)
+    const { driver, accounting } = makeDriver(store, directory)
     const before = promptCalls.length
 
     // a session opens: round 1 is admitted and its prompt is submitted
@@ -189,13 +205,15 @@ describe('a session opening adopts the goal', () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-driver-interrupt-'))
     const store = new GoalStore(directory)
     store.create('interrupt objective', 5, 0)
-    const driver = makeDriver(store)
+    const { driver, accounting } = makeDriver(store, directory)
     const before = promptCalls.length
 
     await driver.onSessionCreated('session-interrupt', directory)
     expect(promptCalls.length).toBe(before + 1)
 
-    // the human pressed escape: the round is accounted, no next round starts
+    // the human pressed escape: the turn's usage was folded from its durable
+    // step event, and no next round starts
+    accounting.onStepEnded(directory, STEP)
     await driver.onTurnFinished('session-interrupt', directory, 'user')
     expect(promptCalls.length).toBe(before + 1)
     expect(store.view()?.usage.inputTokens).toBe(100)
@@ -209,7 +227,7 @@ describe('a session opening adopts the goal', () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-driver-racing-'))
     const racing = new GoalStore(directory)
     racing.create('racing objective', 5, 0)
-    const racingDriver = makeDriver(racing)
+    const { driver: racingDriver } = makeDriver(racing, directory)
 
     let release = (): void => {}
     releasePrompt = () => release()
@@ -236,29 +254,19 @@ describe('a session opening adopts the goal', () => {
     const paused = new GoalStore(pausedDir)
     paused.create('paused objective', 25, 0)
     paused.pause({ id: paused.current!.id, revision: paused.current!.revision })
-    await makeDriver(paused).onSessionCreated('session-paused', pausedDir)
+    await makeDriver(paused, pausedDir).driver.onSessionCreated('session-paused', pausedDir)
     expect(promptCalls.length).toBe(before)
 
     const waitingDir = mkdtempSync(join(tmpdir(), 'goal-driver-wait-adopt-'))
     const waiting = new GoalStore(waitingDir)
     waiting.create('waiting objective', 25, 0)
     waiting.wait({ id: waiting.current!.id, revision: waiting.current!.revision }, 'waiting for review', 60_000)
-    await makeDriver(waiting).onSessionCreated('session-waiting', waitingDir)
+    await makeDriver(waiting, waitingDir).driver.onSessionCreated('session-waiting', waitingDir)
     expect(promptCalls.length).toBe(before)
 
     const emptyDir = mkdtempSync(join(tmpdir(), 'goal-driver-empty-'))
     const empty = new GoalStore(emptyDir)
-    await makeDriver(empty).onSessionCreated('session-empty', emptyDir)
+    await makeDriver(empty, emptyDir).driver.onSessionCreated('session-empty', emptyDir)
     expect(promptCalls.length).toBe(before)
-  })
-})
-
-describe('round prompt rendering', () => {
-  test('renders objective and rules', () => {
-    const goal = store.view()!
-    const text = renderGoalRoundPrompt(goal, 2)
-    expect(text).toContain('[opencode-goal continuation round 2/5]')
-    expect(text).toContain('update_goal')
-    expect(text).toContain('goal_wait')
   })
 })

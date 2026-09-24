@@ -19,8 +19,9 @@
  * Guardrails (pi-goal-style):
  * - Round cap (`maxGoalRounds`): reaching it blocks the goal with
  *   `round-limit` — the DSH round-budget posture.
- * - Token budget (`--tokens`): provider-reported usage is accumulated from the
- *   session transcript; reaching it blocks with `budget-limited`.
+ * - Token budget (`--tokens`): provider-reported usage is accumulated by the
+ *   accounting module from the durable per-step events; reaching it blocks with
+ *   `budget-limited`.
  * - No-progress guard: three consecutive empty or normalized-identical goal
  *   round outputs block with `no-progress`.
  * - External wait (`goal_wait`): suppresses continuation until a deadline.
@@ -31,23 +32,17 @@
  *   meanwhile — opencode coalesces a prompt submitted mid-turn instead of
  *   running it, so a second admission would burn budget without doing work.
  *
- * Usage accounting runs at turn completion: opencode 2.x no longer emits
- * `message.updated`, so the driver reads the session transcript once per
- * finished turn and folds every assistant message newer than the last
- * accounted one into the goal.
+ * Usage accounting is NOT here: it lives in its own module (`accounting.ts`) and
+ * folds the durable session events as they arrive, before this driver sees the
+ * turn-completion event that admits the next round. It used to read the session
+ * transcript once per finished turn, which lost usage after a restart and
+ * blocked an agent that repeated itself while working.
  */
 
 import type { GoalStore } from './state.ts'
-import type { GoalBlockReason, GoalView } from './types.ts'
-
-/** One assistant message as the session transcript reports it. */
-export interface DriverAssistantMessage {
-  readonly id?: string
-  readonly type?: string
-  readonly tokens?: { input?: number; output?: number }
-  readonly cost?: number
-  readonly content?: ReadonlyArray<{ type?: string; text?: string }>
-}
+import type { GoalView } from './types.ts'
+import { admitRound, stopGoal } from './admission.ts'
+import { providerStopReason, renderGoalRoundPrompt } from './round-policy.ts'
 
 /**
  * The slice of the opencode 2.x session domain the driver speaks to. Its read
@@ -55,7 +50,6 @@ export interface DriverAssistantMessage {
  */
 export interface DriverSessionApi {
   prompt(input: { sessionID: string; text: string }): Promise<unknown>
-  context(input: { sessionID: string }): Promise<readonly DriverAssistantMessage[]>
 }
 
 export interface DriverHooks {
@@ -65,70 +59,10 @@ export interface DriverHooks {
   log(message: string, extra?: Record<string, unknown>): void
 }
 
-/** Render the continuation prompt for one admitted round. */
-export function renderGoalRoundPrompt(goal: GoalView, round: number): string {
-  const budget = goal.tokenBudget > 0 ? ` | budget ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}` : ''
-  return [
-    `[opencode-goal continuation round ${round}/${goal.maxGoalRounds}${budget}]`,
-    '',
-    'You are continuing an autonomous goal. The objective is:',
-    '',
-    goal.objective,
-    '',
-    'Rules for this round:',
-    '- Treat the objective as the task; derive concrete requirements from it and from the current worktree.',
-    '- Verify work against real evidence (commands, tests, files, runtime behavior) before claiming completion.',
-    '- If the objective is fully achieved with evidence, call update_goal with action "complete" and a summary of the evidence.',
-    '- If progress is genuinely blocked by something only the user or an external system can resolve (and the same blocker has persisted for at least 3 goal rounds), call update_goal with action "blocked" with a concrete reason.',
-    '- If you are waiting on an external event (e.g. a monitor or review), call goal_wait with a reason and an optional resume_after_ms deadline instead of looping.',
-    '- Do not claim completion without evidence. Do not mark blocked merely because work is difficult.',
-  ].join('\n')
-}
-
-/**
- * Guardrail verdict for admitting one more round: undefined means the round may
- * be admitted, otherwise the goal must be blocked with the returned reason.
- * Shared by the server driver and the TUI `/goal` command's first-round kick so
- * both entry points enforce one budget policy.
- */
-export function goalBlockReason(store: GoalStore, goal: GoalView): GoalBlockReason | undefined {
-  // no-progress guard (pi-goal-style): three consecutive identical/empty rounds
-  if (store.hasRepeatedRounds()) {
-    return {
-      code: 'no-progress',
-      message: 'Goal blocked: three consecutive goal rounds produced empty or identical output.',
-    }
-  }
-  // round cap (DSH round-budget posture)
-  if (goal.roundsStarted >= goal.maxGoalRounds) {
-    return {
-      code: 'round-limit',
-      message: `Goal reached its configured limit of ${goal.maxGoalRounds} rounds.`,
-    }
-  }
-  // token budget (pi-goal-style)
-  const used = goal.usage.inputTokens + goal.usage.outputTokens
-  if (goal.tokenBudget > 0 && used >= goal.tokenBudget) {
-    return {
-      code: 'budget-limited',
-      message: `Goal reached its token budget of ${goal.tokenBudget} tokens (used ${used}).`,
-    }
-  }
-  return undefined
-}
-
-/** How far one session's transcript has been folded into its goal. */
-interface AccountedState {
-  readonly messageID: string | undefined
-  readonly inputTokens: number
-  readonly outputTokens: number
-}
-
 /** The continuation driver: one serialized continuation at a time per session. */
 export class GoalDriver {
   private readonly inflight = new Map<string, Promise<void>>()
   private readonly stores = new Map<string, GoalStore>()
-  private readonly accounted = new Map<string, AccountedState>()
   /** Sessions this driver already auto-started, so one opening is one start. */
   private readonly started = new Set<string>()
   /** Deleted sessions: never driven again, whatever event arrives for them. */
@@ -193,7 +127,7 @@ export class GoalDriver {
     // session re-arms it, and the round below admits it like a resume would
     store.activation = 'armed'
     this.hooks.log('goal adopted by new session', { goalID: goal.id, sessionID, round: goal.roundsStarted + 1 })
-    await this.drive(store, sessionID, goal, directory)
+    await this.drive(store, sessionID, directory)
   }
 
   /** Handle one `session.idle` event: account the finished turn, then maybe inject the next goal round. */
@@ -217,16 +151,24 @@ export class GoalDriver {
    * reliable completion signal — no `session.idle` is published when a prompt
    * turn ends — so it is what keeps the autonomous loop advancing.
    *
-   * A turn the human interrupted (`reason: "user"`) is accounted but not
-   * continued: the human took over, and `/goal resume` starts the next round.
+   * A turn the human interrupted (`reason: "user"`) is not continued: the human
+   * took over, and `/goal resume` starts the next round. Its usage was already
+   * folded by the accounting module from the durable step events.
    */
-  async onTurnFinished(sessionID: string, directory: string, reason?: string): Promise<void> {
+  async onTurnFinished(
+    sessionID: string,
+    directory: string,
+    reason?: string,
+    error?: unknown,
+    durableSeq?: number,
+  ): Promise<void> {
+    if (this.alreadyFoldedTurn(sessionID, durableSeq)) return
     if (this.inflight.has(sessionID) || this.forgotten.has(sessionID)) return
-    const run = this.finish(sessionID, directory, reason).catch((error: unknown) => {
+    const run = this.finish(sessionID, directory, reason, error).catch((error: unknown) => {
       this.hooks.log(`goal round failed: ${error instanceof Error ? error.message : String(error)}`, { sessionID })
     })
     // claim the session synchronously so a burst of completion events cannot
-    // double-drive it while the turn is being accounted
+    // double-drive it while the finished turn is being handled
     this.inflight.set(sessionID, run)
     try {
       await run
@@ -235,13 +177,45 @@ export class GoalDriver {
     }
   }
 
+  /**
+   * Highest durable turn-completion sequence folded per session.
+   *
+   * Turn-completion events are durable, and a durable stream is delivered at
+   * least once: a reconnect replays what this process already handled. Without
+   * this, each replay releases a round that is not in flight and admits another
+   * one, so a goal can burn its whole cap in a reconnect. Accounting already
+   * deduped its own fold this way; the driver did not, which is the same
+   * failure on the other side of the seam.
+   *
+   * Keyed by session rather than by aggregate because the completion event's
+   * `durable.aggregateID` is the session, and bounded by the session count the
+   * same way `forget` bounds everything else.
+   */
+  private readonly foldedTurnSeq = new Map<string, number>()
+
+  /**
+   * Whether one turn-completion event has already been acted on.
+   *
+   * An event with no sequence is folded anyway rather than dropped: durable
+   * events carry one, so an event without it is one this build has not met, and
+   * dropping it would lose a completed turn — the loop would stall silently,
+   * which is worse than admitting a round twice.
+   */
+  private alreadyFoldedTurn(sessionID: string, durableSeq: number | undefined): boolean {
+    if (durableSeq === undefined) return false
+    const folded = this.foldedTurnSeq.get(sessionID)
+    if (folded !== undefined && durableSeq <= folded) return true
+    this.foldedTurnSeq.set(sessionID, durableSeq)
+    return false
+  }
+
   /** Drop every trace of a deleted session so stale state cannot leak. */
   forget(sessionID: string): void {
     this.forgotten.add(sessionID)
     this.started.delete(sessionID)
-    this.accounted.delete(sessionID)
     this.roundsInFlight.delete(sessionID)
     this.inflight.delete(sessionID)
+    this.foldedTurnSeq.delete(sessionID)
     for (const [directory, active] of this.running) {
       if (active === sessionID) this.running.delete(directory)
     }
@@ -253,118 +227,71 @@ export class GoalDriver {
     // the next round, and `session.idle` can fire without a turn finishing
     if (this.roundsInFlight.has(sessionID)) return
     const store = this.storeFor(directory)
-    await this.accountSession(sessionID, store)
-    const goal = store.view()
-    if (goal === undefined || goal.phase !== 'active' || goal.activation !== 'armed') return
-    await this.drive(store, sessionID, goal, directory)
+    await this.drive(store, sessionID, directory)
   }
 
-  /** Account one finished turn reported through the execution events. */
-  private async finish(sessionID: string, directory: string, reason?: string): Promise<void> {
+  /** Finish one turn reported through the execution events. */
+  private async finish(sessionID: string, directory: string, reason?: string, error?: unknown): Promise<void> {
     const store = this.storeFor(directory)
     // the turn that was in flight is over: release the round before admitting
     // the next one, whether or not this session's turn is admitted again
     this.releaseRound(sessionID, directory)
-    await this.accountSession(sessionID, store)
     if (reason === 'user') {
       this.hooks.log('goal round interrupted by the user; waiting for a human turn', { sessionID })
       return
     }
-    const goal = store.view()
-    if (goal === undefined || goal.phase !== 'active' || goal.activation !== 'armed') return
-    await this.drive(store, sessionID, goal, directory)
+    // A provider refusal stops the goal durably, with the reason recorded. It
+    // used to disarm the goal instead, which left it reading `active` in the log
+    // with nothing saying why it had gone quiet, and a restart re-armed it into
+    // the same refusal.
+    const stop = providerStopReason(error)
+    if (stop !== undefined) {
+      if (stopGoal(store, stop)) {
+        this.hooks.log(`goal blocked: ${stop.code}`, { sessionID, directory })
+      } else {
+        this.hooks.log('goal provider stop skipped: another writer moved the goal', { sessionID })
+      }
+      return
+    }
+    await this.drive(store, sessionID, directory)
   }
 
   /**
-   * Attribute every assistant message newer than the last accounted one to the
-   * active goal: provider usage for the token budget and the final text for the
-   * no-progress guard.
+   * Admit the next round through the shared admission seam and submit its
+   * prompt. Everything this method does that admission does not — claiming the
+   * session, submitting the prompt, disarming on a provider error, reporting —
+   * is adapter work, and it is the only reason this method exists.
    */
-  private async accountSession(sessionID: string, store: GoalStore): Promise<void> {
-    const goal = store.view()
-    if (goal === undefined || goal.phase !== 'active') return
-    let messages: readonly DriverAssistantMessage[]
-    try {
-      messages = await this.hooks.session.context({ sessionID })
-    } catch {
-      return // a failed read is retried at the next idle
-    }
-    const seen = this.accounted.get(sessionID)
-    let index = 0
-    if (seen?.messageID !== undefined) {
-      const found = messages.findIndex(message => message.id === seen.messageID)
-      if (found >= 0) index = found + 1
-    }
-    let inputTokens = 0
-    let outputTokens = 0
-    let cost = 0
-    let lastID = seen?.messageID
-    let lastText: string | undefined
-    for (const message of messages.slice(index)) {
-      if (message.type !== undefined && message.type !== 'assistant') continue
-      inputTokens += message.tokens?.input ?? 0
-      outputTokens += message.tokens?.output ?? 0
-      cost += message.cost ?? 0
-      if (message.id !== undefined) lastID = message.id
-      const text = (message.content ?? [])
-        .filter(part => part.type === 'text')
-        .map(part => part.text ?? '')
-        .join('\n')
-      if (text.trim().length > 0) lastText = text
-    }
-    if (inputTokens > 0 || outputTokens > 0 || cost > 0) {
-      store.addUsage({ inputTokens, outputTokens, cost })
-    }
-    if (lastText !== undefined) store.recordRoundOutput(lastText)
-    this.accounted.set(sessionID, {
-      messageID: lastID,
-      inputTokens: (seen?.inputTokens ?? 0) + inputTokens,
-      outputTokens: (seen?.outputTokens ?? 0) + outputTokens,
-    })
-  }
-
-  /** Apply guardrails and inject one continuation round. */
-  private async drive(store: GoalStore, sessionID: string, goal: GoalView, directory: string): Promise<void> {
-    // one round at a time per session: opencode coalesces a prompt submitted
-    // mid-turn, so a second admission would burn a round for no work
+  private async drive(store: GoalStore, sessionID: string, directory: string): Promise<void> {
+    // One round at a time per session: opencode coalesces a prompt submitted
+    // mid-turn, so a second admission would burn a round for no work. This is
+    // deliberately NOT unified with the human command plane's equivalent check.
+    // The server knows from its event stream whether a round is in flight,
+    // because it is the one that submitted the prompt that started it; the
+    // command plane asks the UI whether a turn is active, because it is the one
+    // holding the UI. Neither can answer the other's question, and pretending
+    // otherwise would need a shared turn registry neither entry point owns.
     if (this.roundsInFlight.has(sessionID)) return
-    const now = Date.now()
 
-    // external wait: quiet until the deadline passes or non-goal work wakes us
-    if (store.waitUntil > 0) {
-      if (store.waitUntil > now) return
-      store.waitUntil = 0
-      store.waitReason = undefined
+    const verdict = admitRound(store)
+    if (verdict.kind === 'rejected') {
+      // not-active, disarmed, waiting and stale-ref are all "nothing to do":
+      // admission is re-evaluated at the next trigger, so silence is correct
+      return
     }
-
-    // guardrails shared with the TUI command plane (no-progress / rounds / budget)
-    const blockReason = goalBlockReason(store, goal)
-    if (blockReason !== undefined) {
-      this.blockSafely(store, goal, blockReason)
+    if (verdict.kind === 'blocked') {
+      this.hooks.log(`goal blocked: ${verdict.reason.code}`, { sessionID })
       return
     }
 
-    // admit the round with CAS (stale-turn guard)
-    const round = goal.roundsStarted + 1
+    const goal = store.view()
+    if (goal === undefined) return
+    const round = verdict.round
     const text = renderGoalRoundPrompt(goal, round)
-    let admitted: GoalView
-    try {
-      admitted = store.continue({ id: goal.id, revision: goal.revision })
-    } catch (error) {
-      // another writer won the compare-and-set race (a second plugin instance
-      // for the same project also observed the completion event): its round is
-      // the one that runs here, so this instance stays out of the way
-      this.hooks.log(`goal round not admitted: ${error instanceof Error ? error.message : String(error)}`, {
-        goalID: goal.id,
-        round,
-      })
-      return
-    }
-    this.hooks.log('goal round started', { goalID: goal.id, round, revision: admitted.revision })
 
-    // the round is in flight until its turn reports back through the
-    // execution events; the project is claimed for this session meanwhile so a
-    // second session opening defers instead of racing the same goal
+    // the round is in flight until its turn reports back through the execution
+    // events; the project is claimed for this session meanwhile so a second
+    // session opening defers instead of racing the same goal
     this.roundsInFlight.add(sessionID)
     this.running.set(directory, sessionID)
 
@@ -381,20 +308,35 @@ export class GoalDriver {
           goalID: goal.id,
           round,
         })
-        // do not loop on provider errors: disarm so the next human turn decides
-        store.activation = 'disarmed'
         this.releaseRound(sessionID, directory)
+        // a provider refusal on submission is the same stop the turn-completion
+        // event would have reported, so it is classified the same way
+        const stop = providerStopReason(error)
+        if (stop !== undefined) {
+          if (stopGoal(store, stop)) {
+            this.hooks.log(`goal blocked: ${stop.code}`, { goalID: goal.id, round })
+          }
+          return
+        }
+        // anything else is transient: disarm so the next human turn decides
+        store.activation = 'disarmed'
       })
   }
 
-  /** Block the goal, tolerating a lost compare-and-set race with another writer. */
-  private blockSafely(store: GoalStore, goal: GoalView, blockReason: GoalBlockReason): void {
-    try {
-      store.block({ id: goal.id, revision: goal.revision }, blockReason)
-      this.hooks.log(`goal blocked: ${blockReason.code}`, { goalID: goal.id })
-    } catch (error) {
-      this.hooks.log(`goal block skipped: ${error instanceof Error ? error.message : String(error)}`, { goalID: goal.id })
-    }
+  /**
+   * Whether the turn now running in a session is one this plugin submitted a
+   * continuation prompt for — a goal round, as opposed to a human turn.
+   *
+   * `roundsInFlight` is exactly that set: a session enters it when a round's
+   * prompt is submitted and leaves when the turn reports back. Accounting asks
+   * this so a human's question is not charged to the goal's round budget or its
+   * token budget, and so a human's rephrasing does not read as progress.
+   *
+   * The command plane cannot answer this and the server can, for the same reason
+   * given in `drive()`: the server is the one that submitted the prompt.
+   */
+  isGoalTurn(sessionID: string): boolean {
+    return this.roundsInFlight.has(sessionID)
   }
 
   /** Release the in-flight round of one session (its turn ended or failed). */
