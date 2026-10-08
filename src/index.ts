@@ -16,7 +16,11 @@
  * the only reliable completion signal — `session.created` adopts an active
  * goal into the newly opened session (the human's go-ahead, replacing a manual
  * resume), and `session.deleted` forgets the session. The legacy
- * `session.idle` is still honored while no round is in flight.
+ * `session.idle` is still honored while no round is in flight. One more event
+ * carries no round but ends a wait: `session.inbox.enqueued` is the wake source
+ * an external wait is told to arrange, and it resolves its directory through
+ * the same resolver as everything else because the live server sends it with no
+ * location at all.
  *
  * Usage accounting runs on four more: `session.step.ended` folds the step's
  * token and cost delta, `session.text.ended` buffers the assistant text the
@@ -354,23 +358,33 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
             // fact alone would do; the second is what makes the first redundant
             // rather than the other way round.
             //
+            // The directory comes from the resolver rather than from the event.
+            // Four recordings had a location on this event; the live v2 server
+            // sends none, and the invariant check above reports the disagreement
+            // every time. This branch is the one that hears the wake source, so
+            // it must not be the one branch that requires a location — that is
+            // what made the wake a no-op on the server it has to run on. The
+            // resolver also answers the subagent and ownership questions this
+            // branch used to answer by hand, which is why it now answers them the
+            // way the step and execution branches already do.
+            //
             const sessionID = event.data.sessionID
             if (sessionID === undefined) continue
-            const directory = event.location?.directory
-            if (directory === undefined || directory.length === 0) continue
-            if (childSessions.has(sessionID)) continue
-            if (!ownsDirectory(directory)) continue
-            const store = getStore(directory)
-            const goal = store.view()
-            if (goal === undefined || goal.waitUntil === 0) continue
-            // Arming here is what lets the arriving turn drive the next round:
-            // the goal is active and armed, so when this human's own turn
-            // finishes, admission admits a round rather than reporting
-            // `disarmed`. A store that never mutated the goal stays disarmed, and
-            // this event is that mutation.
-            store.activation = 'armed'
-            store.endWait({ id: goal.id, revision: goal.revision })
-            log('goal wait ended by a human arriving', { goalID: goal.id, directory })
+            void (async () => {
+              const directory = await resolveTurnSession(sessionID, event.location?.directory)
+              if (directory === undefined) return
+              const store = getStore(directory)
+              const goal = store.view()
+              if (goal === undefined || goal.waitUntil === 0) return
+              // Arming here is what lets the arriving turn drive the next round:
+              // the goal is active and armed, so when this human's own turn
+              // finishes, admission admits a round rather than reporting
+              // `disarmed`. A store that never mutated the goal stays disarmed, and
+              // this event is that mutation.
+              store.activation = 'armed'
+              store.endWait({ id: goal.id, revision: goal.revision })
+              log('goal wait ended by a human arriving', { goalID: goal.id, directory })
+            })()
           }
         }
       } catch {

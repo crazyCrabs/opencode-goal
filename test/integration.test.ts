@@ -123,6 +123,7 @@ async function serverHalf(directory: string) {
       text: string,
       itemType: string,
       project: string,
+      withLocation = true,
     ): Promise<void> => {
       queue.push({
         type: 'session.inbox.enqueued',
@@ -131,7 +132,7 @@ async function serverHalf(directory: string) {
           inboxID: `msg-${sessionID}`,
           item: { type: itemType, payload: { text, files: [] }, delivery: 'steer' },
         },
-        location: { directory: project },
+        ...withLocation === true ? { location: { directory: project } } : {},
       })
       await settle()
     },
@@ -222,6 +223,14 @@ async function serverHalf(directory: string) {
     /** The same event, reported for a session in another project. */
     inboxArrivedIn: async (sessionID: string, text: string, project: string): Promise<void> => {
       await inbox.push(sessionID, text, 'user', project)
+    },
+    /**
+     * The same wake event with no location envelope at all, which is what the
+     * live opencode v2 server sends: four recordings had a location on this
+     * event, the live run did not, and ticket 25 is the branch that noticed.
+     */
+    inboxArrivedBare: async (sessionID: string, text: string, itemType = 'user'): Promise<void> => {
+      await inbox.push(sessionID, text, itemType, directory, false)
     },
     /**
      * Emit the turn-completion event opencode 2.x actually publishes —
@@ -522,6 +531,65 @@ describe('the external wait is durable and woken by a human', () => {
     }
   })
 
+  test('a human arriving on a location-less inbox item still ends the wait', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-wait-bare-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('waiting objective')
+      await server.stepStarted('ses-bare')
+      const store = new GoalStore(directory)
+      store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
+
+      // The live v2 server reports this event with no location. Before ticket 25
+      // this branch read the location directly and was the only one that did, so
+      // the wake source was silent on the server the plugin has to run on.
+      await server.inboxArrivedBare('ses-bare', 'the review is done, carry on')
+      const after = new GoalStore(directory).view()!
+      expect(after.waitUntil).toBe(0)
+      expect(after.waitReason).toBeUndefined()
+      expect(after.phase).toBe('active')
+
+      // and the arriving turn drives the next round, armed rather than disarmed
+      await server.turnFinished('ses-bare')
+      expect(server.prompts.length).toBe(1)
+      expect(server.prompts[0].text).toContain('round 2/25')
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("a subagent session's inbox item does not wake the parent's goal", async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-wait-child-'))
+    try {
+      const server = await serverHalf(directory)
+      const tui = tuiHalf(directory)
+      await tui.command.run('waiting objective')
+      const store = new GoalStore(directory)
+      store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
+
+      // a subagent session, in this project, whose inbox item carries no
+      // location — the resolver answers the subagent question the branch used to
+      // answer by hand, so the parent's wait stands
+      await server.created('ses-child', directory, 'ses-parent')
+      await server.inboxArrivedBare('ses-child', 'a subagent arrived')
+      expect(new GoalStore(directory).view()!.waitUntil).toBeGreaterThan(0)
+
+      // and the human still wakes it
+      await server.stepStarted('ses-parent-session')
+      await server.inboxArrivedBare('ses-parent-session', 'the human arrived')
+      expect(new GoalStore(directory).view()!.waitUntil).toBe(0)
+
+      tui.cleanup()
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test("another project's inbox item does not end this project's wait", async () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-wait-other-'))
     const other = mkdtempSync(join(tmpdir(), 'goal-wait-other-'))
@@ -529,7 +597,12 @@ describe('the external wait is durable and woken by a human', () => {
       const server = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
-      await server.stepStarted('ses-other')
+      // a session that genuinely lives in another project: the step-started
+      // event that teaches the adapter its directory names that project, so the
+      // map agrees with the inbox event instead of contradicting it. Naming the
+      // same session here-and-elsewhere, as this helper call used to, is a state
+      // no real session can be in, and the resolver reads the map first.
+      await server.stepStarted('ses-other', other)
       const store = new GoalStore(directory)
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting', 60_000)
 
