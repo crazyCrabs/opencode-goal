@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GoalStore } from '../src/state.ts'
@@ -227,32 +227,153 @@ describe('the overlay accumulates', () => {
   })
 })
 
-describe('usage folded after the last durable mutation', () => {
+describe('usage folded after the last durable mutation is durable at the fold', () => {
   // Reproduced on a live opencode v2 server. A one-round goal ran four steps and
   // folded 46196 input tokens; the goal recorded 22839. Every one of the four
   // `session.step.ended` events reached `onStepEnded` and none was skipped by any
   // of its guards — the first two steps sum to exactly 22839, and the goal's
   // `complete` mutation was stamped 12ms before the third step arrived.
   //
-  // `GoalStore.addUsage` sets an in-memory overlay and writes nothing durable;
-  // the overlay is carried by the *next* mutation, which then clears it. No
-  // mutation followed the third and fourth steps, so their usage was discarded.
+  // `GoalStore.addUsage` was accumulating that into an in-memory overlay that the
+  // next mutation carried, and nothing followed the completing step. It now
+  // appends its own change at the moment of the fold, so this describe is a
+  // regression suite rather than a record of a red test.
   const STEP_ONE_IN = 11390
   const STEP_ONE_OUT = 45
   const STEP_THREE_IN = 11495
   const STEP_THREE_OUT = 191
 
-  // `test.failing`: the suite stays green while the defect is recorded, and turns
-  // red the day it is fixed.
-  test.failing('is not lost to the next reader of the durable log', () => {
+  test('a fresh reader of the log sees usage folded after the last mutation', () => {
     const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-'))
     const store = new GoalStore(dir)
     store.create('overlay objective', 25, 0)
     store.addUsage({ inputTokens: STEP_ONE_IN, outputTokens: STEP_ONE_OUT })
     const current = store.view()!
     store.continue({ id: current.id, revision: current.revision })
+    // step 3 arrives after the goal has stopped changing: nothing follows it
     store.addUsage({ inputTokens: STEP_THREE_IN, outputTokens: STEP_THREE_OUT })
+
+    // the live run recorded 22839, which was steps 1 and 2 exactly
+    expect(store.view()!.usage.inputTokens).toBe(STEP_ONE_IN + STEP_THREE_IN)
     const reread = new GoalStore(dir).view()!
     expect(reread.usage.inputTokens).toBe(STEP_ONE_IN + STEP_THREE_IN)
+    expect(reread.usage.outputTokens).toBe(STEP_ONE_OUT + STEP_THREE_OUT)
+  })
+
+  test('each fold writes its own line instead of riding a later mutation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-lines-'))
+    const store = new GoalStore(dir)
+    store.create('overlay objective', 25, 0)
+    store.addUsage({ inputTokens: 100, outputTokens: 5, cost: 0.01 })
+    store.addUsage({ inputTokens: 50, outputTokens: 2, cost: 0.002 })
+
+    const lines = readFileSync(`${dir}/.opencode/goal-log.jsonl`, 'utf8')
+      .split('\n')
+      .filter(line => line.trim().length > 0)
+    // one create and two folds, not one create carrying both
+    expect(lines.length).toBe(3)
+    const folds = lines.slice(1).map(line => JSON.parse(line))
+    expect(folds.map(fold => fold.operation)).toEqual(['usage', 'usage'])
+    // a delta, not a snapshot, so it cannot replace the goal as another writer
+    // last saw it
+    expect(folds[0].goal).toBeUndefined()
+    expect(folds[0].delta).toMatchObject({ inputTokens: 100, outputTokens: 5 })
+    // and it is not a state verb: the revision it names does not move
+    expect(folds[0].ref).toMatchObject({ revision: 1 })
+  })
+
+  test('a usage line cannot undo a snapshot another writer appended after it', () => {
+    // The ordering this protects against: the server folds a step while the human
+    // pauses the goal from the TUI. A usage line carrying a full snapshot would
+    // arrive last and replace the goal as the folding process last saw it —
+    // undoing the pause, while a round is still in flight for it. The log is
+    // written by hand so the fold, not the writer, decides the outcome.
+    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-clobber-'))
+    const store = new GoalStore(dir)
+    store.create('clobber objective', 25, 0)
+    const ref = { id: store.current!.id, revision: store.current!.revision }
+    store.pause(ref)
+    appendFileSync(
+      `${dir}/.opencode/goal-log.jsonl`,
+      `${JSON.stringify({
+        kind: 'goal/change',
+        version: 1,
+        operation: 'usage',
+        ref: { id: ref.id, revision: 1 },
+        delta: { inputTokens: STEP_ONE_IN, outputTokens: STEP_ONE_OUT },
+        at: Date.now(),
+      })}\n`,
+    )
+
+    const reread = new GoalStore(dir).view()!
+    expect(reread.phase).toBe('paused')
+    expect(reread.usage.inputTokens).toBe(STEP_ONE_IN)
+  })
+
+  test('a log written before usage became durable still folds its total', () => {
+    // Such a log has no `usage` lines at all: its total lives only in the
+    // snapshots, so summing nothing would fold every goal the previous build
+    // wrote as zero usage. Written by hand because a live store can no longer
+    // produce this shape.
+    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-legacy-'))
+    const seed = new GoalStore(dir)
+    seed.create('legacy objective', 25, 0)
+    const base = seed.current!
+    appendFileSync(
+      `${dir}/.opencode/goal-log.jsonl`,
+      [`{"kind":"goal/change","version":1,"operation":"continue","goal":${JSON.stringify({
+        ...base,
+        revision: 2,
+        roundsStarted: 1,
+        usage: { inputTokens: STEP_ONE_IN, outputTokens: STEP_ONE_OUT, cost: 0 },
+      })}}`,
+       `{"kind":"goal/change","version":1,"operation":"complete","goal":${JSON.stringify({
+        ...base,
+        revision: 3,
+        phase: 'complete',
+        roundsStarted: 1,
+        usage: { inputTokens: STEP_ONE_IN + STEP_THREE_IN, outputTokens: STEP_ONE_OUT + STEP_THREE_OUT, cost: 0 },
+      })}}`].join('\n') + '\n',
+    )
+
+    const reread = new GoalStore(dir).view()!
+    expect(reread.phase).toBe('complete')
+    expect(reread.usage.inputTokens).toBe(STEP_ONE_IN + STEP_THREE_IN)
+  })
+
+  test('a goal that replaces a completed one does not inherit its usage', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-next-'))
+    const first = new GoalStore(dir)
+    first.create('first objective', 25, 0)
+    const ref = { id: first.current!.id, revision: first.current!.revision }
+    first.addUsage({ inputTokens: STEP_ONE_IN, outputTokens: STEP_ONE_OUT })
+    first.complete(ref)
+
+    // the next goal starts from zero rather than from the previous one's steps
+    const second = new GoalStore(dir)
+    second.create('second objective', 25, 0)
+    second.addUsage({ inputTokens: 100, outputTokens: 1 })
+    const reread = new GoalStore(dir).view()!
+    expect(reread.objective).toBe('second objective')
+    expect(reread.usage.inputTokens).toBe(100)
+  })
+
+  test('a usage line for another goal is not added to this one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'goal-acc-overlay-foreign-'))
+    const store = new GoalStore(dir)
+    store.create('owned objective', 25, 0)
+    appendFileSync(
+      `${dir}/.opencode/goal-log.jsonl`,
+      `${JSON.stringify({
+        kind: 'goal/change',
+        version: 1,
+        operation: 'usage',
+        ref: { id: 'goal-someone-else', revision: 9 },
+        delta: { inputTokens: 999_999, outputTokens: 999_999 },
+        at: Date.now(),
+      })}\n`,
+    )
+
+    expect(new GoalStore(dir).view()!.usage.inputTokens).toBe(0)
   })
 })

@@ -65,10 +65,25 @@ export interface GoalFoldState {
   readonly lastRef: GoalRef | undefined
 }
 
-/** Pure last-wins fold over durable goal facts. */
+/**
+ * Pure last-wins fold over durable goal facts.
+ *
+ * Usage is folded separately from the goal snapshot, because the two arrive on
+ * different kinds of line. A snapshot line carries the goal as its writer last
+ * saw it; a `usage` line carries only a delta, and it can arrive after the goal
+ * has stopped changing — which is exactly the case that used to lose it. The
+ * accumulator therefore runs alongside the snapshot, and the rule for when it
+ * adopts a snapshot's carried value is what keeps old and new logs both folding
+ * correctly; see the comment on the seeding below.
+ */
 export function foldGoalLog(lines: readonly string[]): GoalFoldState {
   let goal: GoalSnapshot | undefined
   let lastRef: GoalRef | undefined
+  let usage: GoalUsage = EMPTY_USAGE
+  /** The goal the usage accumulator belongs to. */
+  let usageGoalID: string | undefined
+  /** Whether a delta has already been folded for `usageGoalID`. */
+  let usageFromDelta = false
   for (const line of lines) {
     if (line.trim().length === 0) continue
     let change: GoalChangeMeta
@@ -78,15 +93,48 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
       continue // tolerate a torn tail write
     }
     if (change.kind !== 'goal/change' || change.version !== GOAL_CHANGE_VERSION) continue
+    if (change.operation === 'usage') {
+      // a delta, and only for the goal it names: one written by another goal's
+      // writer must not be added to this one
+      if (goal !== undefined && change.ref.id === goal.id) {
+        usage = {
+          inputTokens: usage.inputTokens + (change.delta.inputTokens ?? 0),
+          outputTokens: usage.outputTokens + (change.delta.outputTokens ?? 0),
+          cost: usage.cost + (change.delta.cost ?? 0),
+        }
+        usageFromDelta = true
+      }
+      continue
+    }
     if (change.operation === 'clear') {
       goal = undefined
       lastRef = change.cleared
+      usage = EMPTY_USAGE
+      usageGoalID = undefined
+      usageFromDelta = false
     } else {
       goal = normalizeSnapshot(change.goal)
       lastRef = { id: change.goal.id, revision: change.goal.revision }
+      // Seed the accumulator from a snapshot's carried usage while no delta has
+      // been folded for this goal, and never after one has.
+      //
+      // The first half is what keeps a log written before usage became durable
+      // readable: such a log has no `usage` lines at all and its total lives
+      // only in the snapshots, so summing nothing would fold every one of them as
+      // zero usage. The second half is what stops a new-style log from
+      // double-counting: once a delta has landed, every later snapshot already
+      // carries the sum of the deltas before it.
+      //
+      // A new goal id re-seeds regardless, so a completed goal's usage is not
+      // inherited by the goal that replaces it.
+      if (usageGoalID !== change.goal.id || !usageFromDelta) {
+        usage = { ...change.goal.usage }
+        usageGoalID = change.goal.id
+        usageFromDelta = false
+      }
     }
   }
-  return { goal, lastRef }
+  return { goal: goal === undefined ? undefined : { ...goal, usage }, lastRef }
 }
 
 /** Per-session runtime state held only in this process. */
@@ -418,21 +466,81 @@ export class GoalStore {
     return this.runtime.turnsWithoutToolCall >= goal.maxTurnsWithoutToolCall
   }
 
-  /** Add assistant usage to the goal's cumulative counters. */
+  /**
+   * Add assistant usage to the goal's cumulative counters, durably, at the
+   * moment of the fold.
+   *
+   * This used to accumulate in memory and ride the next mutation, which loses
+   * everything folded after the last one. Measured on a live server: a one-round
+   * goal folded 46 196 input tokens and recorded 22 839, because the two steps
+   * after the goal went complete had no mutation left to carry them — 22 839 is
+   * exactly steps 1 and 2, and the `complete` was stamped 12 ms before step 3.
+   * The same overlay discarded everything pending when the process exited, which
+   * is the in-memory dependence ticket 14 set out to remove, reintroduced for
+   * exactly the usage that is hardest to recover.
+   *
+   * The change is a **delta**, and it does not bump the revision. Both are
+   * load-bearing:
+   *
+   * - The fold is last-wins per line, so a usage line carrying a snapshot would
+   *   replace the goal as this process last saw it. A `/goal pause` written by
+   *   the TUI while a round is in flight — a real ordering, because a paused
+   *   goal's in-flight round still reports its steps — would be undone by the
+   *   next usage line, which predates the pause. A delta cannot clobber anything.
+   * - The revision is the coordinate every caller-held ref and the arming rule
+   *   in `applyActivation` read. A usage fold is not a state verb and must not
+   *   look like one, or a process folding steps would arm goals it never ran.
+   *
+   * The cost is one log line per step, about 180 bytes — a ref, three numbers
+   * and a timestamp, no snapshot. A 25-round goal with several steps each is a
+   * few hundred lines.
+   *
+   * A failed append falls back to the in-memory overlay so the goal keeps
+   * running: a throw here would propagate into the plugin's event loop and end
+   * the stream, so one bad write degrades one bookkeeping number instead of
+   * every event after it.
+   */
   addUsage(usage: Partial<GoalUsage>): void {
     const goal = this.state.goal
     if (goal === undefined) return
-    // accumulate on the *visible* usage, not the durable one: usage is carried on
-    // the next durable mutation, so the durable value stays put between calls and
-    // reading it would make every call after the first replace the first's delta
     const current = this.effectiveUsage(goal)
     const next: GoalUsage = {
       inputTokens: current.inputTokens + (usage.inputTokens ?? 0),
       outputTokens: current.outputTokens + (usage.outputTokens ?? 0),
       cost: current.cost + (usage.cost ?? 0),
     }
-    // usage is carried on the next durable mutation; keep an in-memory overlay
-    this.usageOverlay = next
+    const delta: GoalUsage = {
+      inputTokens: next.inputTokens - current.inputTokens,
+      outputTokens: next.outputTokens - current.outputTokens,
+      cost: next.cost - current.cost,
+    }
+    // adopt locally first, so a second fold in the same tick accumulates on this
+    // one even before the append returns
+    this.state = { ...this.state, goal: { ...goal, usage: next } }
+    try {
+      this.appendUsage({ id: goal.id, revision: goal.revision }, delta)
+    } catch {
+      this.usageOverlay = next
+    }
+  }
+
+  /**
+   * Append one usage delta.
+   *
+   * Deliberately not `commit`: a usage line is not a snapshot, so it must not
+   * touch the projection or the overlay the way every mutation does.
+   */
+  private appendUsage(ref: GoalRef, delta: GoalUsage): void {
+    mkdirSync(dirname(this.logPath), { recursive: true })
+    appendFileSync(this.logPath, `${JSON.stringify({
+      kind: 'goal/change',
+      version: GOAL_CHANGE_VERSION,
+      operation: 'usage',
+      ref,
+      delta,
+      at: Date.now(),
+    })}\n`)
+    this.usageOverlay = undefined
   }
 
   private usageOverlay: GoalUsage | undefined
@@ -456,7 +564,7 @@ export class GoalStore {
   }
 
   /** Append one durable event and update the in-memory projection. */
-  private commit(change: GoalChangeMeta): void {
+  private commit(change: GoalSnapshotChangeMeta | GoalClearChangeMeta): void {
     mkdirSync(dirname(this.logPath), { recursive: true })
     appendFileSync(this.logPath, `${JSON.stringify(change)}\n`)
     this.seq += 1

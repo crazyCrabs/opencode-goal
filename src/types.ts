@@ -214,14 +214,52 @@ export type GoalOperation =
   | 'block'
   | 'continue'
   | 'wait'
+  | 'usage'
   | 'clear'
+
+/**
+ * State verbs a full-snapshot mutation can be. `usage` is deliberately absent:
+ * it carries a delta and no snapshot, because the fold is last-wins per line and
+ * a usage line that replaced the goal would clobber a concurrent writer's
+ * snapshot. See `GoalStore.addUsage`.
+ */
+export type GoalSnapshotOperation =
+  | 'create'
+  | 'edit'
+  | 'pause'
+  | 'resume'
+  | 'complete'
+  | 'block'
+  | 'continue'
+  | 'wait'
 
 /** Full-snapshot mutation committed by a durable `goal/change` event. */
 export interface GoalSnapshotChangeMeta {
   readonly kind: 'goal/change'
   readonly version: 1
-  readonly operation: Exclude<GoalOperation, 'clear'>
+  readonly operation: GoalSnapshotOperation
   readonly goal: GoalSnapshot
+}
+
+/**
+ * One usage fold, committed at the moment it is known.
+ *
+ * It is a delta rather than a snapshot and it does not bump the revision, so it
+ * can neither replace the goal as another writer last saw it nor move the
+ * coordinate every caller-held ref and `applyActivation` read. It exists because
+ * usage accumulated in memory is lost with the process — measured on a live
+ * server: a one-round goal folded 46 196 input tokens and recorded 22 839.
+ */
+export interface GoalUsageChangeMeta {
+  readonly kind: 'goal/change'
+  readonly version: 1
+  readonly operation: 'usage'
+  /** The goal the delta belongs to. */
+  readonly ref: GoalRef
+  /** Tokens and cost this fold added, each possibly absent. */
+  readonly delta: Partial<GoalUsage>
+  /** When the fold was committed. */
+  readonly at: number
 }
 
 /** Tombstone retained when the current goal is cleared. */
@@ -234,7 +272,7 @@ export interface GoalClearChangeMeta {
 }
 
 /** Durable change union carried by the goal domain's own log event. */
-export type GoalChangeMeta = GoalSnapshotChangeMeta | GoalClearChangeMeta
+export type GoalChangeMeta = GoalSnapshotChangeMeta | GoalUsageChangeMeta | GoalClearChangeMeta
 
 /** Stable error codes for rejected goal reads and mutations. */
 export type GoalErrorCode =
