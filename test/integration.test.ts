@@ -941,3 +941,123 @@ describe('TUI command plane + server driver', () => {
     }
   })
 })
+
+describe('a goal that predates the process is re-armed by a human turn', () => {
+  test('the opencode run case: goal and session both predate the process', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-adopt-both-predate-'))
+    try {
+      // yesterday: the goal was created, and a session was opened for it
+      const yesterdays = await serverHalf(directory)
+      await yesterdays.tool('create_goal').execute({ objective: 'yesterday objective' })
+      await yesterdays.stepStarted('ses-old')
+      await yesterdays.cleanup()
+
+      // today: a fresh process, and the session is still there. No
+      // `session.created` will ever name it, so nothing re-arms the goal.
+      const server = await serverHalf(directory)
+      expect(server.prompts.length).toBe(0)
+
+      // the human sends a message; the goal says nothing because it is disarmed
+      await server.stepStarted('ses-old')
+      await server.turnFinished('ses-old')
+
+      // the finished human turn is the go-ahead: the goal is re-armed and its
+      // first round is admitted, in the session the human is already in
+      expect(server.prompts.length).toBe(1)
+      expect(server.prompts[0].sessionID).toBe('ses-old')
+      expect(server.prompts[0].text).toContain('round 1/25')
+      expect(server.prompts[0].text).toContain('yesterday objective')
+
+      // and the loop keeps going from there, with no further human input
+      await server.toolCalled('ses-old', 'call-adopt')
+      await server.turnFinished('ses-old')
+      expect(server.prompts.length).toBe(2)
+      expect(server.prompts[1].text).toContain('round 2/25')
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('an interrupted round stops, and the next human turn restarts it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-adopt-interrupt-'))
+    try {
+      const yesterday = await serverHalf(directory)
+      await yesterday.tool('create_goal').execute({ objective: 'interrupted objective' })
+      await yesterday.stepStarted('ses-int')
+      await yesterday.cleanup()
+
+      const server = await serverHalf(directory)
+      expect(server.prompts.length).toBe(0)
+
+      // the first human turn re-arms the goal and admits round 1
+      await server.stepStarted('ses-int')
+      await server.turnFinished('ses-int')
+      expect(server.prompts.length).toBe(1)
+
+      // the human takes the wheel mid-round: no next round is admitted
+      await server.toolCalled('ses-int', 'call-int-1')
+      await server.turnFinished('ses-int', 'interrupted', 'user')
+      expect(server.prompts.length).toBe(1)
+
+      // and the next human turn picks the goal back up
+      await server.toolCalled('ses-int', 'call-int-2')
+      await server.turnFinished('ses-int')
+      expect(server.prompts.length).toBe(2)
+      expect(server.prompts[1].text).toContain('round 2/25')
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a goal that is not running is not re-armed into running', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-adopt-not-running-'))
+    try {
+      // the goal completed yesterday, so a human turn today means nothing
+      const yesterday = await serverHalf(directory)
+      await yesterday.tool('create_goal').execute({ objective: 'finished objective' })
+      await yesterday.tool('update_goal').execute({
+        action: 'complete',
+        claim: {
+          summary: 'the objective was met',
+          criteria: [{ criterion: 'the objective was met', evidence: ['the tool reports it'] }],
+          checks: [],
+        },
+      })
+      await yesterday.stepStarted('ses-done')
+      await yesterday.cleanup()
+
+      const server = await serverHalf(directory)
+      await server.stepStarted('ses-done')
+      await server.turnFinished('ses-done')
+      expect(server.prompts.length).toBe(0)
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a paused goal is not re-armed either', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-adopt-paused-'))
+    try {
+      const yesterday = await serverHalf(directory)
+      await yesterday.tool('create_goal').execute({ objective: 'paused objective' })
+      await yesterday.tool('update_goal').execute({ action: 'pause' })
+      await yesterday.stepStarted('ses-paused')
+      await yesterday.cleanup()
+
+      const server = await serverHalf(directory)
+      await server.stepStarted('ses-paused')
+      await server.turnFinished('ses-paused')
+      expect(server.prompts.length).toBe(0)
+
+      await server.cleanup()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})

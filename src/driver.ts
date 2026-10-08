@@ -130,6 +130,48 @@ export class GoalDriver {
     await this.drive(store, sessionID, directory)
   }
 
+  /**
+   * Adopt a goal that predates this process, on the evidence of a human turn.
+   *
+   * A goal that merely survived a restart is disarmed: `GoalStore` arms only a
+   * goal mutated after the store came alive. Re-arming one needs an explicit
+   * human go-ahead, and `onSessionCreated` treats opening a session as one. That
+   * trigger fires once per session, at creation, so it structurally cannot see a
+   * session that already existed before this process — which is every session in
+   * `opencode run --standalone` (four live runs, zero `session.created` events)
+   * and every session left open across a server restart.
+   *
+   * A finished human turn is a go-ahead of the same kind and is not one-shot: it
+   * arrives every time the human sends a message. It is also the only signal
+   * left. This plugin cannot enumerate sessions — `session.list` and
+   * `session.active` exist on the HTTP client and are absent from the plugin
+   * context's `SessionDomain` — so a poll could see the goal and never the
+   * session it should run in, and there is no file-watch API anywhere in the
+   * plugin surface to hook the log instead. Jev was asked directly whether a
+   * timer is ever justified here and answered no (16% yes).
+   *
+   * Only the arming happens here; whether the goal runs is admission's decision,
+   * taken through the same seam as every other trigger, so a paused, blocked,
+   * completed or waiting goal is rejected there rather than armed into running.
+   *
+   * A goal round's own completion is not a human turn, and consenting to itself
+   * would be circular: `roundsInFlight` still holds the session at this point
+   * (`finish` is what releases it, and it runs after this), so the turn being
+   * reported is recognised as the goal's own. That is also why this is the
+   * driver's decision and not the event handler's — the driver is the only one
+   * that knows whose turn it was.
+   */
+  adoptOnHumanTurn(sessionID: string, directory: string): void {
+    if (this.isGoalTurn(sessionID)) return
+    const store = this.storeFor(directory)
+    const goal = store.view()
+    if (goal === undefined || goal.phase !== 'active') return
+    // an already-armed goal needs nothing: this is a re-arm, not a resume
+    if (store.activation === 'armed') return
+    store.activation = 'armed'
+    this.hooks.log('goal re-armed by a human turn', { goalID: goal.id, sessionID, directory })
+  }
+
   /** Handle one `session.idle` event: account the finished turn, then maybe inject the next goal round. */
   async onSessionIdle(sessionID: string, directory: string): Promise<void> {
     if (this.inflight.has(sessionID) || this.forgotten.has(sessionID)) return

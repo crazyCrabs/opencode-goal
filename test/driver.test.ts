@@ -270,3 +270,87 @@ describe('a session opening adopts the goal', () => {
     expect(promptCalls.length).toBe(before)
   })
 })
+
+describe('a finished human turn re-arms a goal that predates the process', () => {
+  test('the goal starts, in the session the human is already in', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-human-turn-'))
+    // yesterday: the goal was created and left active
+    const previous = new GoalStore(directory)
+    previous.create('survivor objective', 5, 0)
+
+    // today: a fresh store reads it as pre-existing, so disarmed — the state a
+    // restart leaves, and the state `opencode run --standalone` starts in, where
+    // `session.created` never fires at all (four live runs, zero events)
+    const today = new GoalStore(directory)
+    expect(today.activation).toBe('disarmed')
+    const { driver: turnDriver } = makeDriver(today, directory)
+
+    const before = promptCalls.length
+    // the human sends a message and it finishes: that is the go-ahead
+    await turnDriver.adoptOnHumanTurn('session-human', directory)
+    expect(today.activation).toBe('armed')
+    await turnDriver.onTurnFinished('session-human', directory)
+    expect(promptCalls.length).toBe(before + 1)
+    expect(promptCalls[before].sessionID).toBe('session-human')
+    expect(promptCalls[before].text).toContain('round 1/5')
+
+    // The arm is tied to a finished turn, not to the goal merely being present:
+    // a goal created while this store was alive is already armed (mutatedWhileAlive),
+    // so the case this method exists for is only ever a goal that predates it.
+  })
+
+  test("a goal round's own completion cannot consent for the goal", async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-own-turn-'))
+    const own = new GoalStore(directory)
+    own.create('own round objective', 5, 0)
+    const { driver: ownDriver } = makeDriver(own, directory)
+
+    // a session opens: round 1 is admitted, so its round is in flight and the
+    // driver knows the turn running there is the goal's own
+    await ownDriver.onSessionCreated('session-own', directory)
+    expect(own.current?.roundsStarted).toBe(1)
+
+    // Disarm by hand to the state a paused goal is in, so the re-arm would be
+    // visible if it happened. `finish` releases the round AFTER the arm runs, so
+    // this is the exact ordering the plugin event handler uses.
+    own.activation = 'disarmed'
+    ownDriver.adoptOnHumanTurn('session-own', directory)
+    expect(own.activation).toBe('disarmed')
+
+    // a human turn in another session is a different story, and re-arms it
+    ownDriver.adoptOnHumanTurn('session-human', directory)
+    expect(own.activation).toBe('armed')
+  })
+
+  test('a goal that is not running is never re-armed into running', async () => {
+    const before = promptCalls.length
+
+    const completeDir = mkdtempSync(join(tmpdir(), 'goal-driver-human-complete-'))
+    const complete = new GoalStore(completeDir)
+    complete.create('finished objective', 5, 0)
+    complete.complete({ id: complete.current!.id, revision: complete.current!.revision })
+    const completeDriver = makeDriver(complete, completeDir).driver
+    await completeDriver.adoptOnHumanTurn('session-complete', completeDir)
+    expect(complete.activation).toBe('disarmed')
+    expect(promptCalls.length).toBe(before)
+
+    const pausedDir = mkdtempSync(join(tmpdir(), 'goal-driver-human-paused-'))
+    const paused = new GoalStore(pausedDir)
+    paused.create('paused objective', 5, 0)
+    paused.pause({ id: paused.current!.id, revision: paused.current!.revision })
+    await makeDriver(paused, pausedDir).driver.adoptOnHumanTurn('session-paused', pausedDir)
+    expect(paused.activation).toBe('disarmed')
+    expect(promptCalls.length).toBe(before)
+
+    const blockedDir = mkdtempSync(join(tmpdir(), 'goal-driver-human-blocked-'))
+    const blocked = new GoalStore(blockedDir)
+    blocked.create('blocked objective', 5, 0)
+    blocked.block(
+      { id: blocked.current!.id, revision: blocked.current!.revision },
+      { code: 'no-progress', message: 'the goal stopped making progress' },
+    )
+    await makeDriver(blocked, blockedDir).driver.adoptOnHumanTurn('session-blocked', blockedDir)
+    expect(blocked.activation).toBe('disarmed')
+    expect(promptCalls.length).toBe(before)
+  })
+})

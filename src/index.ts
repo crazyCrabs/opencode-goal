@@ -13,14 +13,19 @@
  * The driver runs on three events: `session.execution.succeeded|failed|
  * interrupted` continues the goal after each finished turn — opencode 2.x
  * publishes no `session.idle` when a turn ends, so the execution events are
- * the only reliable completion signal — `session.created` adopts an active
- * goal into the newly opened session (the human's go-ahead, replacing a manual
- * resume), and `session.deleted` forgets the session. The legacy
- * `session.idle` is still honored while no round is in flight. One more event
- * carries no round but ends a wait: `session.inbox.enqueued` is the wake source
- * an external wait is told to arrange, and it resolves its directory through
- * the same resolver as everything else because the live server sends it with no
- * location at all.
+ * the only reliable completion signal — and, on the same event, a finished turn
+ * the goal did not submit itself re-arms a goal that predates this process. That
+ * second job exists because `session.created` is the only other adoption
+ * trigger and fires once per session at creation, so it structurally cannot see
+ * a session that already existed: every session in `opencode run --standalone`
+ * (four live runs, zero events) and every session left open across a restart.
+ * `session.created` adopts an active goal into a newly opened session (the
+ * human's go-ahead, replacing a manual resume), and `session.deleted` forgets
+ * the session. The legacy `session.idle` is still honored while no round is in
+ * flight. One more event carries no round but ends a wait:
+ * `session.inbox.enqueued` is the wake source an external wait is told to
+ * arrange, and it resolves its directory through the same resolver as everything
+ * else because the live server sends it with no location at all.
  *
  * Usage accounting runs on four more: `session.step.ended` folds the step's
  * token and cost delta, `session.text.ended` buffers the assistant text the
@@ -287,6 +292,12 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
               // completion handler, so a guardrail checked at admission sees the
               // counters the turn that just ended actually produced.
               accounting.onTurnEnded(directory, sessionID)
+              // A goal that predates this process is disarmed, and `session.created`
+              // cannot re-arm it for a session that already existed — the
+              // `opencode run --standalone` and restart cases. A finished human turn
+              // does, and it is the only signal that can: the plugin context cannot
+              // enumerate sessions, so there is no poll that would ever find one.
+              driver.adoptOnHumanTurn(sessionID, directory)
               await driver.onTurnFinished(sessionID, directory, reason, error, event.durable?.seq)
             })()
           } else if (event.type === 'session.step.started') {
