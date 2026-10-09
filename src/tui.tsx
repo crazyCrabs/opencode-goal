@@ -181,7 +181,9 @@ function truncateObjective(objective: string, max = 60): string {
 }
 
 /** Sidebar text for one goal: a headline and an optional progress line. */
-export function goalSidebarSummary(goal: GoalView | undefined): { headline: string; detail: string } {
+export function goalSidebarSummary(
+  goal: GoalView | undefined,
+): { headline: string; detail: string; reason?: string } {
   if (goal === undefined) return { headline: 'No goal — /goal <objective>', detail: '' }
   const progress = goal.tokenBudget > 0
     ? `rounds ${goal.roundsStarted}/${goal.maxGoalRounds} · tokens ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}`
@@ -189,7 +191,15 @@ export function goalSidebarSummary(goal: GoalView | undefined): { headline: stri
   // only the durable phase is shown: activation is process-local and the sidebar
   // folds the log from its own process, so it cannot observe the driver's state
   const badge = goal.phase === 'blocked' ? `blocked: ${goal.blockedReason?.code ?? 'unknown'}` : goal.phase
-  return { headline: `${badge} · ${truncateObjective(goal.objective)}`, detail: progress }
+  return {
+    headline: `${badge} · ${truncateObjective(goal.objective)}`,
+    detail: progress,
+    // The code alone is machine-routable and says nothing a human can act on.
+    // `usage-limited` and `provider refused the request (HTTP 403): ...` are the
+    // same fact at two altitudes, and the sidebar is the only surface the human
+    // is guaranteed to be looking at.
+    reason: goal.phase === 'blocked' ? goal.blockedReason?.message : undefined,
+  }
 }
 
 /** Sidebar row: durable phase, objective, and budget progress. */
@@ -210,6 +220,9 @@ function GoalSidebarView(props: { goal: GoalView | undefined; onCommand(command:
             <>
               <text>{summary.headline}</text>
               <text style={{ fg: 'gray' }}>{summary.detail}</text>
+              {summary.reason === undefined ? null : (
+                <text style={{ fg: 'yellow' }}>{summary.reason}</text>
+              )}
               {/*
                 A ternary, not a nested `<Show>`: a falsy `Show` inside a `<box>`
                 makes the opentui renderer's `insertExpression` clear the parent's
@@ -541,7 +554,13 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
         // re-created after a clear has a new id, so it starts again, and a second
         // session is not started from while the first is running the goal.
         //
+        // The same key records the last block the human was told about, so a stop
+        // the server driver performs is announced once rather than on every poll.
+        // The driver blocks from its own process — a provider refusal reported on
+        // a failed turn — and until now the only trace was in the goal log, so a
+        // human watching the TUI had no way to learn the goal had stopped.
         const started = new Set<string>()
+        const announcedBlock = new Set<string>()
         const autoStart = (): void => {
           const id = sessionID()
           const dir = directory()
@@ -559,9 +578,33 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           started.add(`${goal.id}:${id}`)
           void kickRound(store)
         }
+        /**
+         * Announce a stop this plane did not perform, once per goal revision.
+         *
+         * The server driver stops a goal on a provider refusal, and it does so in
+         * its own process. The sidebar shows the code on its next refresh, but a
+         * code with no message is machine-routable and silent to a human, and a
+         * refresh nobody is watching announces nothing. Keyed by goal and
+         * revision so a resume that stops again is announced again.
+         */
+        const announceBlock = (goal: GoalView): void => {
+          const key = `${goal.id}:${goal.revision}`
+          if (announcedBlock.has(key)) return
+          announcedBlock.add(key)
+          const reason = goal.blockedReason
+          toast(
+            'warning',
+            `Goal blocked (${reason?.code ?? 'unknown'}): ${reason?.message ?? 'no reason recorded'}`,
+            STATUS_TOAST_MS,
+          )
+        }
         const bump = (): void => {
           setTick(value => value + 1)
           autoStart()
+          const dir = directory()
+          if (dir.length === 0) return
+          const goal = openStore(dir).view()
+          if (goal !== undefined && goal.phase === 'blocked') announceBlock(goal)
         }
         const unsubscribe = context.data?.on?.('session.execution.succeeded', bump)
         const interval = refreshIntervalMs > 0 ? setInterval(bump, refreshIntervalMs) : undefined

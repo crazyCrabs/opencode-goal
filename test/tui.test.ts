@@ -450,44 +450,44 @@ describe('tui goal command plane', () => {
   })
 })
 
+/** A harness whose sidebar poll actually runs, at a 1ms cadence. */
+function polling(route: TuiRouteRef, options: { canCreate?: boolean } = {}): Mock {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-tui-auto-'))
+  cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
+  const harness = makeContext(directory, route)
+  if (options.canCreate === false) {
+    // a client that cannot create a session: the plugin must say so rather
+    // than fall silent after a successful create
+    ;(harness.context.client as { session: Record<string, unknown> }).session.create = undefined
+  }
+  const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 1 }).setup(harness.context)
+  cleanups.push(cleanup)
+  harness.slots.find(claim => claim.append === 'app')?.render({})
+  return {
+    directory,
+    context: harness.context,
+    toasts: harness.toasts,
+    prompts: harness.prompts,
+    created: harness.created,
+    navigated: harness.navigated,
+    slots: harness.slots,
+    confirms: harness.confirms,
+    objectivePrompts: harness.objectivePrompts,
+    layers: harness.layers,
+    state: harness.state,
+    mountKeymapLayer: () => {},
+    slot: (append: string) => harness.slots.find(claim => claim.append === append),
+    command: (id: string) => (harness.layers[0]?.commands ?? []).find(command => command.id === id)!,
+    unsubscribed: () => harness.unsubscribed(),
+  }
+}
+
+/** Let the sidebar poll run a few times. */
+async function ticks(count = 5): Promise<void> {
+  for (let i = 0; i < count; i++) await new Promise(resolve => setTimeout(resolve, 4))
+}
+
 describe('the home route: a goal starts without the human sending a message', () => {
-  /** A harness whose sidebar poll actually runs, at a 1ms cadence. */
-  function polling(route: TuiRouteRef, options: { canCreate?: boolean } = {}): Mock {
-    const directory = mkdtempSync(join(tmpdir(), 'goal-tui-auto-'))
-    cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
-    const harness = makeContext(directory, route)
-    if (options.canCreate === false) {
-      // a client that cannot create a session: the plugin must say so rather
-      // than fall silent after a successful create
-      ;(harness.context.client as { session: Record<string, unknown> }).session.create = undefined
-    }
-    const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 1 }).setup(harness.context)
-    cleanups.push(cleanup)
-    harness.slots.find(claim => claim.append === 'app')?.render({})
-    return {
-      directory,
-      context: harness.context,
-      toasts: harness.toasts,
-      prompts: harness.prompts,
-      created: harness.created,
-      navigated: harness.navigated,
-      slots: harness.slots,
-      confirms: harness.confirms,
-      objectivePrompts: harness.objectivePrompts,
-      layers: harness.layers,
-      state: harness.state,
-      mountKeymapLayer: () => {},
-      slot: (append: string) => harness.slots.find(claim => claim.append === append),
-      command: (id: string) => (harness.layers[0]?.commands ?? []).find(command => command.id === id)!,
-      unsubscribed: () => harness.unsubscribed(),
-    }
-  }
-
-  /** Let the poll run a few times. */
-  async function ticks(count = 5): Promise<void> {
-    for (let i = 0; i < count; i++) await new Promise(resolve => setTimeout(resolve, 4))
-  }
-
   test('a goal that predates the session starts when one is opened', async () => {
     // What this used to assert was the reported defect: `/goal create` from the
     // home route admitted nothing until a session opened. That case now makes its
@@ -586,6 +586,97 @@ describe('the home route: a goal starts without the human sending a message', ()
       await ticks(20)
       expect(harness.prompts.length).toBe(1)
       expect(new GoalStore(harness.directory).current?.roundsStarted).toBe(1)
+    } finally {
+      // handled by cleanups
+    }
+  })
+})
+
+describe('a blocked goal says why, without the human opening the log', () => {
+  /** A goal stopped by the server driver, not by this plane. */
+  function blockFromOutside(directory: string, code: string, message: string): void {
+    const writer = new GoalStore(directory)
+    const goal = writer.view()!
+    writer.block({ id: goal.id, revision: goal.revision }, { code: code as never, message })
+  }
+
+  test('the sidebar carries the block reason, not only its code', async () => {
+    const mock = setup()
+    await mock.command('goal.command').run!('blocked objective')
+    mock.prompts.length = 0
+
+    // the server driver stops the goal: this plane never ran admission
+    blockFromOutside(mock.directory, 'usage-limited', 'Goal stopped: the provider refused the request (HTTP 403): Upstream request failed.')
+
+    const summary = goalSidebarSummary(new GoalStore(mock.directory).view())
+    expect(summary.headline).toContain('blocked: usage-limited')
+    // the reason a human can act on, not just the machine code
+    expect(summary.reason).toBe('Goal stopped: the provider refused the request (HTTP 403): Upstream request failed.')
+  })
+
+  test('the sidebar renders a blocked goal with its reason', async () => {
+    const mock = setup()
+    await mock.command('goal.command').run!('render blocked')
+    blockFromOutside(mock.directory, 'no-tool-call', 'Goal blocked: 2 consecutive goal turns ended with no tool call (limit 2).')
+
+    const claim = mock.slot('sidebar.content')
+    expect(() => mountSlot(claim!)).not.toThrow()
+    const summary = goalSidebarSummary(new GoalStore(mock.directory).view())
+    expect(summary.reason).toContain('no tool call')
+  })
+
+  test('the poll tells the human once, when the goal stops', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-block' })
+    try {
+      await harness.command('goal.command').run!('will be blocked')
+      await ticks(3)
+      harness.toasts.length = 0
+
+      // the server driver stops the goal while this plane is idle
+      blockFromOutside(harness.directory, 'usage-limited', 'Goal stopped: the provider refused the request (HTTP 403).')
+
+      await ticks(10)
+      const told = harness.toasts.filter(toast => toast.message.includes('usage-limited'))
+      expect(told.length).toBe(1)
+      // and the reason is in the toast, so the human does not have to open the log
+      expect(told[0].message).toContain('the provider refused')
+
+      // it does not repeat on every poll
+      await ticks(20)
+      expect(harness.toasts.filter(toast => toast.message.includes('usage-limited')).length).toBe(1)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a goal that stops and is resumed is told about again', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-block-again' })
+    try {
+      await harness.command('goal.command').run!('blocked twice')
+      await ticks(3)
+      blockFromOutside(harness.directory, 'usage-limited', 'Goal stopped: the provider refused the request (HTTP 403).')
+      await ticks(10)
+      expect(harness.toasts.filter(toast => toast.message.includes('usage-limited')).length).toBe(1)
+
+      // the human resumes, the goal runs, and it stops again
+      await harness.command('goal.command').run!('resume')
+      await ticks(3)
+      blockFromOutside(harness.directory, 'usage-limited', 'Goal stopped: the provider refused the request (HTTP 403).')
+      await ticks(10)
+      expect(harness.toasts.filter(toast => toast.message.includes('usage-limited')).length).toBe(2)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a goal that never blocks is never told about a block', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-fine' })
+    try {
+      await harness.command('goal.command').run!('a goal that is never blocked')
+      await ticks(20)
+      // the exact phrase the announcement uses: a loose 'blocked' would match the
+      // word inside an objective and the test would pass or fail on phrasing
+      expect(harness.toasts.some(toast => toast.message.includes('Goal blocked ('))).toBe(false)
     } finally {
       // handled by cleanups
     }
