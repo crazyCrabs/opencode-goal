@@ -271,8 +271,43 @@ export interface GoalClearChangeMeta {
   readonly clearedAt: number
 }
 
+/**
+ * One round lease: which process is driving the goal's current round, and until
+ * when.
+ *
+ * This is a coordinate, not a state verb. It never changes the goal's phase,
+ * revision or usage, and `foldGoalLog` never counts it as a round — a lease line
+ * read as one would make every round look like two.
+ *
+ * It exists because the driver's own in-flight bookkeeping is in-memory and
+ * keyed by session, so a second opencode process on the same worktree cannot see
+ * the first one's round. Measured: one turn-completion event fanned out to two
+ * plugin processes admitted two rounds, and with opencode's prompt coalescing
+ * the result was a self-driving loop of `continue` mutations with no step ever
+ * completing. Ticket 27.
+ */
+export interface GoalLeaseChangeMeta {
+  readonly kind: 'goal/lease'
+  readonly version: 1
+  /** The goal being driven. A lease naming another goal is ignored by the fold. */
+  readonly id: string
+  /** The process holding the round. One per plugin process, for its lifetime. */
+  readonly holder: string
+  /** When this lease was taken or renewed. */
+  readonly at: number
+  /**
+   * When the holder must have renewed by. A release sets this to `at`, which
+   * makes the lease immediately stale — an expiry in the past rather than a
+   * delete, because an append-only log cannot delete.
+   */
+  readonly expiresAt: number
+}
+
 /** Durable change union carried by the goal domain's own log event. */
 export type GoalChangeMeta = GoalSnapshotChangeMeta | GoalUsageChangeMeta | GoalClearChangeMeta
+
+/** Every durable line kind the goal log can hold. */
+export type GoalLogLine = GoalChangeMeta | GoalLeaseChangeMeta
 
 /** Stable error codes for rejected goal reads and mutations. */
 export type GoalErrorCode =

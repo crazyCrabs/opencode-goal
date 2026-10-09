@@ -15,6 +15,7 @@
  * event that would otherwise wake the driver.
  */
 
+import { randomUUID } from 'node:crypto'
 import { createRoot, createSignal, onCleanup, Show, type JSX } from 'solid-js'
 import { executeGoalCommand, parseGoalCommand, type GoalCommandOutcome, type ParsedGoalCommand } from './commands.ts'
 import { admitRound, stopGoal } from './admission.ts'
@@ -229,6 +230,19 @@ function GoalSidebarView(props: { goal: GoalView | undefined; onCommand(command:
  */
 export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
   const refreshIntervalMs = options.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS
+  /**
+   * This TUI process's lease holder id.
+   *
+   * The command plane is a separate process from the server driver, and it writes
+   * the same goal log, so it takes part in the same round ownership. Presenting
+   * a holder here means a human's `/goal resume` defers to a server process that
+   * is mid-round rather than starting a second one; a human who wants the round
+   * can wait for the lease to expire, which a dead process's lease does within a
+   * minute. The alternative — the command plane overriding the lease — is exactly
+   * the double-driving ticket 27 exists to close, arriving through the one door
+   * that is meant to be the human's.
+   */
+  const holder = randomUUID()
   return {
     id: 'opencode-goal.tui',
     setup(context: TuiGoalContext): () => void {
@@ -274,7 +288,7 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           // started the turn. Neither can answer the other's question.
           if (isRunning(context, id)) return
 
-          const verdict = admitRound(store)
+          const verdict = admitRound(store, { holder })
           if (verdict.kind === 'rejected') {
             // not-active, disarmed, waiting and stale-ref all mean "nothing to
             // do". `stale-ref` is the one worth naming: another writer admitted

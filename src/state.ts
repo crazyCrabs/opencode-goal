@@ -33,9 +33,12 @@ import {
   type GoalSnapshotChangeMeta,
   type GoalUsage,
   type GoalView,
+  type GoalLeaseChangeMeta,
+  type GoalLogLine,
 } from './types.ts'
 
 const GOAL_CHANGE_VERSION = 1
+const GOAL_LEASE_VERSION = 1
 
 /** Coerce a possibly-missing legacy `tokenBudget` field into the durable shape. */
 function normalizeSnapshot(snapshot: GoalSnapshot): GoalSnapshot {
@@ -63,6 +66,11 @@ export interface GoalFoldState {
   readonly goal: GoalSnapshot | undefined
   /** Latest mutation ref, including a clear tombstone. */
   readonly lastRef: GoalRef | undefined
+  /**
+   * The last lease line folded, whether or not it has expired. Expiry is decided
+   * at read time, so a holder's death is visible without rewriting history.
+   */
+  readonly lease: GoalLeaseChangeMeta | undefined
 }
 
 /**
@@ -80,18 +88,28 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
   let goal: GoalSnapshot | undefined
   let lastRef: GoalRef | undefined
   let usage: GoalUsage = EMPTY_USAGE
+  let lease: GoalLeaseChangeMeta | undefined
   /** The goal the usage accumulator belongs to. */
   let usageGoalID: string | undefined
   /** Whether a delta has already been folded for `usageGoalID`. */
   let usageFromDelta = false
   for (const line of lines) {
     if (line.trim().length === 0) continue
-    let change: GoalChangeMeta
+    let parsed: GoalLogLine
     try {
-      change = JSON.parse(line) as GoalChangeMeta
+      parsed = JSON.parse(line) as GoalLogLine
     } catch {
       continue // tolerate a torn tail write
     }
+    // A lease is a coordinate, not a state verb: it is folded into its own slot
+    // and never reaches the goal accumulator, the revision, or `lastRef`. A
+    // lease naming a goal other than the one now current is dropped rather than
+    // applied, so one writer's lease cannot hold another goal's round.
+    if (parsed.kind === 'goal/lease') {
+      if (goal !== undefined && parsed.id === goal.id) lease = parsed
+      continue
+    }
+    const change = parsed
     if (change.kind !== 'goal/change' || change.version !== GOAL_CHANGE_VERSION) continue
     if (change.operation === 'usage') {
       // a delta, and only for the goal it names: one written by another goal's
@@ -112,6 +130,8 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
       usage = EMPTY_USAGE
       usageGoalID = undefined
       usageFromDelta = false
+      // a cleared goal has no round to own, so its lease goes with it
+      lease = undefined
     } else {
       goal = normalizeSnapshot(change.goal)
       lastRef = { id: change.goal.id, revision: change.goal.revision }
@@ -134,7 +154,11 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
       }
     }
   }
-  return { goal: goal === undefined ? undefined : { ...goal, usage }, lastRef }
+  return {
+    goal: goal === undefined ? undefined : { ...goal, usage },
+    lastRef,
+    lease,
+  }
 }
 
 /** Per-session runtime state held only in this process. */
@@ -195,7 +219,7 @@ export class GoalStore {
   constructor(worktree: string) {
     this.logPath = `${worktree}/.opencode/goal-log.jsonl`
     this.runtime = emptyRuntime()
-    this.state = { goal: undefined, lastRef: undefined }
+    this.state = { goal: undefined, lastRef: undefined, lease: undefined }
     if (existsSync(this.logPath)) {
       const lines = readFileSync(this.logPath, 'utf8').split('\n')
       this.state = foldGoalLog(lines)
@@ -233,7 +257,7 @@ export class GoalStore {
     if (!existsSync(this.logPath)) {
       const previous = this.state.goal
       if (previous === undefined) return
-      this.state = { goal: undefined, lastRef: this.state.lastRef }
+      this.state = { goal: undefined, lastRef: this.state.lastRef, lease: this.state.lease }
       this.applyExternalChange(previous, undefined)
       return
     }
@@ -569,11 +593,99 @@ export class GoalStore {
     appendFileSync(this.logPath, `${JSON.stringify(change)}\n`)
     this.seq += 1
     if (change.operation === 'clear') {
-      this.state = { goal: undefined, lastRef: change.cleared }
+      this.state = { goal: undefined, lastRef: change.cleared, lease: undefined }
     } else {
-      this.state = { goal: change.goal, lastRef: { id: change.goal.id, revision: change.goal.revision } }
+      // A state verb never touches the lease: it is a coordinate, and a round
+      // admitted between the lease line and the commit keeps it.
+      this.state = { goal: change.goal, lastRef: { id: change.goal.id, revision: change.goal.revision }, lease: this.state.lease }
     }
     this.usageOverlay = undefined
+  }
+
+  /**
+   * Claim the current round for this process, durably.
+   *
+   * Written after admission commits, so the `continue` line is already in the log
+   * when another process re-folds it: the lease describes a round that exists.
+   *
+   * A renewal is the same call with a later `expiresAt`. It is a plain append
+   * rather than an update because the log is append-only, and the fold is
+   * last-wins, so a renewal simply supersedes the lease it replaces.
+   */
+  holdRound(ref: GoalRef, holder: string, expiresAt: number): void {
+    this.expectCurrent(ref)
+    const at = Date.now()
+    mkdirSync(dirname(this.logPath), { recursive: true })
+    appendFileSync(this.logPath, `${JSON.stringify({
+      kind: 'goal/lease',
+      version: GOAL_LEASE_VERSION,
+      id: ref.id,
+      holder,
+      at,
+      expiresAt: Math.max(expiresAt, at),
+    } satisfies GoalLeaseChangeMeta)}\n`)
+    this.seq += 1
+  }
+
+  /**
+   * Release the round this process holds, if it still holds it.
+   *
+   * A release is a lease line whose expiry is already past, not a delete: an
+   * append-only log cannot delete, and a past expiry is what the fold already
+   * knows how to read. A holder that is no longer the holder — another process
+   * took the round over — writes nothing, because overwriting a live lease would
+   * hand the round back to a process that just lost it.
+   */
+  releaseRound(ref: GoalRef, holder: string): void {
+    const current = this.current
+    if (current === undefined || current.id !== ref.id) return
+    const lease = this.state.lease
+    if (lease !== undefined && lease.holder !== holder) return
+    const at = Date.now()
+    mkdirSync(dirname(this.logPath), { recursive: true })
+    appendFileSync(this.logPath, `${JSON.stringify({
+      kind: 'goal/lease',
+      version: GOAL_LEASE_VERSION,
+      id: ref.id,
+      holder,
+      at,
+      expiresAt: at,
+    } satisfies GoalLeaseChangeMeta)}\n`)
+    this.seq += 1
+  }
+
+  /**
+   * The lease currently holding the goal's round, or undefined when none is
+   * live.
+   *
+   * Expiry is read at call time rather than stored, so a process that died
+   * mid-round releases its round by doing nothing at all: the lease ages out and
+   * the next admission is allowed. That is the whole crash story, and it needs no
+   * liveness protocol.
+   */
+  get lease(): GoalLeaseChangeMeta | undefined {
+    this.sync()
+    const lease = this.state.lease
+    if (lease === undefined) return undefined
+    if (lease.expiresAt <= Date.now()) return undefined
+    return lease
+  }
+
+  /**
+   * Renew this process's lease only when it is close enough to expiry to be
+   * worth a line.
+   *
+   * Without the threshold every step of every round would append a line, and a
+   * twenty-round goal would write two hundred of them for one fact. With it, a
+   * round renews about once per half-window, which is also the natural rate at
+   * which the lease's expiry means anything.
+   */
+  renewLeaseIfDue(ref: GoalRef, holder: string, windowMs: number): void {
+    this.sync()
+    const lease = this.state.lease
+    if (lease === undefined || lease.holder !== holder) return
+    if (lease.expiresAt - Date.now() >= windowMs / 2) return
+    this.holdRound(ref, holder, Date.now() + windowMs)
   }
 
   /** Build a snapshot carrying the current usage overlay. */

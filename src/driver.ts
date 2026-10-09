@@ -39,10 +39,24 @@
  * blocked an agent that repeated itself while working.
  */
 
+import { randomUUID } from 'node:crypto'
 import type { GoalStore } from './state.ts'
 import type { GoalView } from './types.ts'
 import { admitRound, stopGoal } from './admission.ts'
 import { providerStopReason, renderGoalRoundPrompt } from './round-policy.ts'
+
+/**
+ * How long a round lease survives without a renewal.
+ *
+ * A dead-man's switch, not a timeout on work: the round's own step events renew
+ * it, so a live round never reaches it however long the round takes. A process
+ * that dies mid-round renews nothing and ages out in this window, after which
+ * another process may take the round over. The value is generous because the
+ * failure it has to survive is a step interval — a turn that runs a build or a
+ * test suite produces no step event for minutes — and because the cost of being
+ * wrong in the other direction is that a dead holder stalls the goal for longer.
+ */
+const LEASE_WINDOW_MS = 60_000
 
 /**
  * The slice of the opencode 2.x session domain the driver speaks to. Its read
@@ -83,8 +97,22 @@ export class GoalDriver {
    */
   private readonly running = new Map<string, string>()
   private directory = ''
+  /**
+   * This process's lease holder id, generated once per driver.
+   *
+   * The driver is one per plugin process, so this is one per process, which is
+   * what a lease is keyed by. Two opencode processes on the same worktree have
+   * two drivers and therefore two holders, and the log can tell them apart —
+   * which is the whole point, because their in-memory round bookkeeping cannot.
+   */
+  private readonly holder = randomUUID()
 
   constructor(private readonly hooks: DriverHooks) {}
+
+  /** The id this process presents when it claims a round. */
+  get leaseHolder(): string {
+    return this.holder
+  }
 
   /** Bind the driver to the plugin's project directory. */
   setDirectory(directory: string): void {
@@ -278,6 +306,13 @@ export class GoalDriver {
     // the turn that was in flight is over: release the round before admitting
     // the next one, whether or not this session's turn is admitted again
     this.releaseRound(sessionID, directory)
+    // ...and release the lease with it, so the round the next admission takes is
+    // claimed rather than inherited. A process that dies instead of reaching
+    // this line never releases, which is exactly why the lease has an expiry.
+    const goal = store.view()
+    if (goal !== undefined) {
+      store.releaseRound({ id: goal.id, revision: goal.revision }, this.holder)
+    }
     if (reason === 'user') {
       this.hooks.log('goal round interrupted by the user; waiting for a human turn', { sessionID })
       return
@@ -315,10 +350,23 @@ export class GoalDriver {
     // otherwise would need a shared turn registry neither entry point owns.
     if (this.roundsInFlight.has(sessionID)) return
 
-    const verdict = admitRound(store)
+    const verdict = admitRound(store, { holder: this.holder })
     if (verdict.kind === 'rejected') {
       // not-active, disarmed, waiting and stale-ref are all "nothing to do":
-      // admission is re-evaluated at the next trigger, so silence is correct
+      // admission is re-evaluated at the next trigger, so silence is correct.
+      // `leased` is the same silence for a different reason — another process
+      // holds the round — and it is deliberately not surfaced to the model,
+      // because there is nothing for the model to do about it either. It is
+      // logged, though, because the alternative is diagnosing a two-process
+      // stand-off from a log that says nothing about why one side went quiet.
+      if (verdict.code === 'leased') {
+        const lease = store.lease
+        this.hooks.log('goal round deferred: another process holds the round', {
+          sessionID,
+          goalID: store.view()?.id,
+          holder: lease?.holder,
+        })
+      }
       return
     }
     if (verdict.kind === 'blocked') {
@@ -330,6 +378,12 @@ export class GoalDriver {
     if (goal === undefined) return
     const round = verdict.round
     const text = renderGoalRoundPrompt(goal, round)
+
+    // Claim the round in the log before submitting, so another process that
+    // re-folds while this prompt is in flight sees a holder and defers. After
+    // the submission rather than before, so the lease describes a round that
+    // exists — the `continue` line admission committed is already there.
+    store.holdRound({ id: goal.id, revision: goal.revision }, this.holder, Date.now() + LEASE_WINDOW_MS)
 
     // the round is in flight until its turn reports back through the execution
     // events; the project is claimed for this session meanwhile so a second
@@ -351,6 +405,8 @@ export class GoalDriver {
           round,
         })
         this.releaseRound(sessionID, directory)
+        // the round is over in every sense, so the lease goes with it
+        store.releaseRound({ id: goal.id, revision: goal.revision }, this.holder)
         // a provider refusal on submission is the same stop the turn-completion
         // event would have reported, so it is classified the same way
         const stop = providerStopReason(error)
@@ -379,6 +435,24 @@ export class GoalDriver {
    */
   isGoalTurn(sessionID: string): boolean {
     return this.roundsInFlight.has(sessionID)
+  }
+
+  /**
+   * Renew this process's lease on a round it is currently holding.
+   *
+   * Renewal is driven by the round's own step events rather than by a timer: a
+   * step is the proof the round is still running, and it is the same signal the
+   * driver already folds for usage, so no new clock is introduced. A round that
+   * produces no step events renews nothing and ages out, which is the intended
+   * behaviour — a round doing no work is exactly the one another process should
+   * be able to take over.
+   */
+  renewLeaseFor(sessionID: string, directory: string): void {
+    if (!this.isGoalTurn(sessionID)) return
+    const store = this.storeFor(directory)
+    const goal = store.view()
+    if (goal === undefined) return
+    store.renewLeaseIfDue({ id: goal.id, revision: goal.revision }, this.holder, LEASE_WINDOW_MS)
   }
 
   /** Release the in-flight round of one session (its turn ended or failed). */

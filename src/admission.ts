@@ -35,7 +35,21 @@ import { gateBlock, goalBlockReason } from './round-policy.ts'
 export type AdmissionVerdict =
   | { kind: 'admitted'; round: number }
   | { kind: 'blocked'; reason: GoalBlockReason }
-  | { kind: 'rejected'; code: 'not-active' | 'disarmed' | 'stale-ref' | 'waiting' | 'judgment-pending' }
+  | {
+      kind: 'rejected'
+      code: 'not-active' | 'disarmed' | 'stale-ref' | 'waiting' | 'judgment-pending' | 'leased'
+    }
+
+/**
+ * Who is asking, when the caller is a process that can hold a lease.
+ *
+ * `holder` is generated once per plugin process. A caller that passes none —
+ * every existing caller, and every test — is checked against no lease at all,
+ * which is the pre-lease behaviour rather than a silent refusal.
+ */
+export interface AdmissionRequest {
+  readonly holder?: string
+}
 
 /**
  * Decide whether one more round may be admitted, and commit the decision.
@@ -49,21 +63,26 @@ export type AdmissionVerdict =
  *    restart waits for an explicit resume or a session opening. A caller that
  *    mutates the goal (a create, edit or resume) arms its own store first, so
  *    this rejects only a goal nobody has touched.
- * 3. **Waiting.** An external wait whose deadline is still in the future
+ * 3. **Leased.** Another process holds the goal's current round, so this one
+ *    must not start a second. Checked before the wait and the guardrails
+ *    because it is the question "is this mine to decide at all", and a process
+ *    answering no must not also cross a round boundary or stop the goal on the
+ *    holder's behalf. The holder's own process answers yes and proceeds.
+ * 4. **Waiting.** An external wait whose deadline is still in the future
  *    suppresses continuation. One whose deadline has passed stops the goal with
  *    `wait-expired` rather than resuming it blind. Both halves live in this one
  *    policy, which is what stops the two entry points disagreeing about whether
  *    a wait ended and what ending it means.
- * 4. **Guardrails.** A breach stops the goal with a reason, unless the breach
+ * 5. **Guardrails.** A breach stops the goal with a reason, unless the breach
  *    is a judgment that has not yet persisted, in which case the round runs
  *    anyway — "not yet" is an instruction to keep going, not a verdict. A lost
  *    race with another writer is reported as `stale-ref` rather than thrown,
  *    because the other writer's round is the one that runs.
- * 5. **Admit.** The compare-and-set is the stale-turn guard: a caller holding a
+ * 6. **Admit.** The compare-and-set is the stale-turn guard: a caller holding a
  *    view from before another writer's mutation is rejected rather than
  *    double-admitting a round.
  */
-export function admitRound(store: GoalStore): AdmissionVerdict {
+export function admitRound(store: GoalStore, request?: AdmissionRequest): AdmissionVerdict {
   const goal = store.view()
   if (goal === undefined || goal.phase !== 'active') {
     return { kind: 'rejected', code: 'not-active' }
@@ -72,6 +91,23 @@ export function admitRound(store: GoalStore): AdmissionVerdict {
     return { kind: 'rejected', code: 'disarmed' }
   }
 
+  // Another process is driving this goal's round. The lease is durable, so this
+  // process reads the same one its competitor wrote, and the check is a plain
+  // read of the fold admission already performed — no coordination beyond it.
+  //
+  // It does not make admission atomic: two processes can both pass this before
+  // either writes, and one extra round is then admitted. What it does close is
+  // the loop, which is what made the original defect unbounded. The first lease
+  // written is the one every subsequent admission sees, so the second process
+  // defers from then on and the cascade converges on a single driver instead of
+  // running until a stall guard happens to fire.
+  const holder = request?.holder
+  if (holder !== undefined) {
+    const lease = store.lease
+    if (lease !== undefined && lease.holder !== holder) {
+      return { kind: 'rejected', code: 'leased' }
+    }
+  }
   // External wait: quiet until the deadline passes, and then stopped rather than
   // resumed. The wait is durable now, so a fresh process reads the same deadline
   // and reaches the same verdict — which is the point, because the alternative

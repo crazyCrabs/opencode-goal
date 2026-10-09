@@ -343,6 +343,11 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
             if (directory === undefined) continue
             if (event.type === 'session.step.ended') {
               accounting.onStepEnded(directory, event.data, event.durable?.seq)
+              // A step of a round this process holds keeps the lease alive. A
+              // step of anything else — a human's turn, a subagent's — must not,
+              // because the lease is this process's claim on the round and
+              // nothing else may renew it.
+              driver.renewLeaseFor(sessionID, directory)
             } else if (event.type === 'session.text.ended') {
               accounting.onTextEnded(directory, event.data)
             } else if (event.type === 'session.tool.success') {
