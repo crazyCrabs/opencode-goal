@@ -7,7 +7,7 @@
  * failed there.
  */
 import { describe, expect, test, afterEach, beforeEach } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, existsSync, appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OpenCodeGoalPlugin } from '../src/index.ts'
@@ -245,5 +245,63 @@ describe('ticket 27 — two processes on one goal log', () => {
     const { GoalStore } = await import('../src/state.ts')
     const store2 = new GoalStore(directory)
     expect(store2.lease?.holder).toBeDefined()
+  })
+})
+
+describe('ticket 27 through the read path', () => {
+  test('a process defers to a lease it only learned by folding the log', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lease-read-'))
+    cleanup.push(directory)
+    const process = await processOn(directory)
+    const logPath = logPathFor(directory)
+
+    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' })
+    process.queue.push({
+      type: 'session.step.started',
+      data: { sessionID: 'ses-read', info: { id: 'ses-read', directory } },
+      location: { directory },
+    })
+    // a human turn, which is what arms a goal that predates this process
+    process.queue.push({
+      type: 'session.created',
+      data: { sessionID: 'ses-read', info: { id: 'ses-read', directory } },
+      location: { directory },
+    })
+    await settle()
+    console.log = originalLog
+
+    const roundsBefore = continuesIn(directory)
+    expect(roundsBefore).toBe(1)
+
+    // A second process claims the round by writing a lease line directly. This
+    // process did not see it happen — it only ever folds the log — so the lease
+    // has to be visible through `sync()` or it is not visible at all.
+    const { GoalStore } = await import('../src/state.ts')
+    const foreign = new GoalStore(directory)
+    const goal = foreign.view()!
+    appendFileSync(
+      logPath,
+      `${JSON.stringify({
+        kind: 'goal/lease',
+        version: 1,
+        id: goal.id,
+        holder: 'a-process-that-wrote-the-log',
+        at: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      })}\n`,
+    )
+
+    // now this process takes a turn of its own and reaches admission
+    process.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'ses-read' } })
+    await settle()
+
+    const roundsAfter = continuesIn(directory)
+    console.log('rounds before the foreign lease:', roundsBefore, ' after:', roundsAfter)
+    const leases = logLines(directory).filter(line => line['kind'] === 'goal/lease')
+    console.log('lease lines:', leases.length, 'holders:', new Set(leases.map(l => l['holder'])).size)
+
+    // the goal is still active and a round was available, so the only thing that
+    // can have stopped this process is the lease it read out of the log
+    expect(roundsAfter).toBe(roundsBefore)
   })
 })

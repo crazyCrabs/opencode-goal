@@ -60,6 +60,39 @@ function sameGoal(a: GoalSnapshot | undefined, b: GoalSnapshot | undefined): boo
   return a.id === b.id && a.revision === b.revision && a.phase === b.phase
 }
 
+/**
+ * Whether two folded goals report the same usage.
+ *
+ * Separate from `sameGoal` because usage is not part of a goal's identity: a
+ * usage delta does not bump the revision (ADR 0002), so a fold that differs only
+ * in usage has moved something a reader depends on without moving the goal.
+ */
+function sameUsage(a: GoalSnapshot | undefined, b: GoalSnapshot | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return (
+    a.usage.inputTokens === b.usage.inputTokens &&
+    a.usage.outputTokens === b.usage.outputTokens &&
+    a.usage.cost === b.usage.cost
+  )
+}
+
+/**
+ * Whether two folded leases are the same claim.
+ *
+ * Compared field by field rather than by reference because a lease is re-appended
+ * on every renewal, so a live round's lease is a different line every time while
+ * remaining the same claim.
+ */
+function sameLease(a: GoalLeaseChangeMeta | undefined, b: GoalLeaseChangeMeta | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.id === b.id && a.holder === b.holder && a.expiresAt === b.expiresAt
+}
+
+/** Whether a fold holds nothing any reader of this store depends on. */
+function unchangedFold(a: GoalFoldState, b: GoalFoldState): boolean {
+  return sameGoal(a.goal, b.goal) && sameUsage(a.goal, b.goal) && sameLease(a.lease, b.lease)
+}
+
 /** Fold state rebuilt from the log. */
 export interface GoalFoldState {
   /** Current goal snapshot, absent after a clear or before the first create. */
@@ -258,7 +291,8 @@ export class GoalStore {
       const previous = this.state.goal
       if (previous === undefined) return
       this.state = { goal: undefined, lastRef: this.state.lastRef, lease: this.state.lease }
-      this.applyExternalChange(previous, undefined)
+      // the goal is gone: that is a state verb, whatever removed it
+      this.applyExternalChange(previous, undefined, true)
       return
     }
     let lines: string[]
@@ -269,13 +303,32 @@ export class GoalStore {
     }
     const folded = foldGoalLog(lines)
     const previous = this.state.goal
-    if (sameGoal(previous, folded.goal)) return
+    // The early return is what keeps a read cheap, and it has to cover
+    // everything a reader depends on, not only the goal: `view()` reads the
+    // goal's usage and `lease` reads the lease. Comparing identity alone made a
+    // foreign usage delta or a foreign lease invisible until a snapshot mutation
+    // happened to land, which is a process reporting stale usage indefinitely and
+    // — worse for ADR 0005 — a process admitting a round another process's lease
+    // already covered.
+    if (unchangedFold(this.state, folded)) return
+    // A usage delta and a lease are coordinates, not state verbs. Neither one
+    // re-arms or dis-arms this store, neither resets the no-progress history, and
+    // neither clears this process's own usage overlay. Only the goal itself moving
+    // — a different id, a higher revision, a different phase — does those things,
+    // and running them for a coordinate is what would disarm an armed store: the
+    // revision has not moved, so `applyActivation` would read "not mutated while
+    // alive" and switch it off.
+    const stateVerb = !sameGoal(previous, folded.goal)
     this.state = folded
-    this.applyExternalChange(previous, folded.goal)
+    this.applyExternalChange(previous, folded.goal, stateVerb)
   }
 
   /** Adopt an externally folded goal, preserving usage accounting. */
-  private applyExternalChange(previous: GoalSnapshot | undefined, next: GoalSnapshot | undefined): void {
+  private applyExternalChange(
+    previous: GoalSnapshot | undefined,
+    next: GoalSnapshot | undefined,
+    stateVerb: boolean,
+  ): void {
     if (next === undefined) {
       // external clear: drop every process-local trace of the goal
       this.runtime.activation = 'disarmed'
@@ -283,6 +336,9 @@ export class GoalStore {
       this.usageOverlay = undefined
       return
     }
+    // A coordinate moved and nothing else: the new state is already adopted
+    // above, and every process-local consequence below belongs to a state verb.
+    if (!stateVerb) return
     const replaced = previous === undefined || previous.id !== next.id
     if (replaced || next.phase !== previous?.phase) {
       this.runtime.recentOutputs.length = 0
