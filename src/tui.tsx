@@ -82,6 +82,12 @@ export interface TuiRouteRef {
  */
 export interface TuiSessionClient {
   prompt(input: { sessionID: string; text: string }): Promise<unknown> | unknown
+  /**
+   * Create a session. Present on the real client's `SessionDomain` (confirmed in
+   * `@opencode/plugin`'s `promise/session.d.ts`), and optional here so a context
+   * without it degrades to the old hint rather than throwing.
+   */
+  create?(input?: Record<string, never>): Promise<unknown> | unknown
 }
 
 /** Minimal TUI plugin context surface (opencode 2.x TUI plugin API). */
@@ -96,7 +102,15 @@ export interface TuiGoalContext {
   ui: {
     toast: { show(input: TuiToastInput): void }
     dialog: TuiDialogApi
-    router: { current(): TuiRouteRef | undefined }
+    router: {
+      current(): TuiRouteRef | undefined
+      /**
+       * Put the human on a route. Optional because the surface the plugin was
+       * written against only declared `current`; the opencode binary carries
+       * `navigate` and calls it with exactly this shape.
+       */
+      navigate?(route: { type: string; sessionID?: string }): void
+    }
     slot?(claim: { append: string; render: (input: { sessionID?: string }) => unknown }): void
   }
 }
@@ -261,6 +275,51 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
         }
 
         /**
+         * The session a goal round runs in, making one when none is open.
+         *
+         * This exists because the router does not become a session route when a
+         * session is created. Measured in the opencode binary: the navigation to
+         * `{type:"session", sessionID}` sits inside the prompt-submit handler
+         * (`if (!i.sessionID) { ...; V.navigate({type:"session", sessionID}) }`),
+         * so a session opened with `<leader>n` leaves the router on `home` until
+         * the human sends something. Waiting for the route was therefore waiting
+         * for the very act the goal is meant to remove, which is exactly what the
+         * reported defect was: `/goal` from the home route printed a hint and
+         * nothing ran until the human typed a message.
+         *
+         * The session is created before the goal is, so the server driver's
+         * `session.created` handler fires while no goal exists and does nothing.
+         * The other order would have both the driver and this plane admit round 1,
+         * and the round lease would have to sort it out.
+         */
+        const ensureSession = async (): Promise<string | undefined> => {
+          const open = sessionID()
+          if (open.length > 0) return open
+          const create = context.client?.session?.create
+          if (typeof create !== 'function') return undefined
+          let made: unknown
+          try {
+            made = await create.call(context.client!.session!, {})
+          } catch {
+            return undefined // a client that refused is a client that cannot help
+          }
+          const id =
+            typeof made === 'string'
+              ? made
+              : ((made as { id?: unknown; sessionID?: unknown } | undefined)?.id ??
+                  (made as { sessionID?: unknown } | undefined)?.sessionID)
+          if (typeof id !== 'string' || id.length === 0) return undefined
+          // put the human in the room the goal is working in, so the round is
+          // visible rather than happening in a session nobody is looking at
+          try {
+            context.ui.router.navigate?.({ type: 'session', sessionID: id })
+          } catch {
+            // a router without navigate still leaves the goal running
+          }
+          return id
+        }
+
+        /**
          * Start the goal's next working round from the command plane: admit one
          * round and submit its continuation prompt. The server driver then
          * continues from the following turn's completion event.
@@ -274,8 +333,8 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
          * when it ends is decided once.
          */
         const kickRound = async (store: GoalStore): Promise<void> => {
-          const id = sessionID()
-          if (id.length === 0) {
+          const id = await ensureSession()
+          if (id === undefined) {
             // nothing can run the round here: say so instead of going silent
             // after a successful create/edit/resume
             toast('info', NO_SESSION_HINT, ACTION_TOAST_MS)
@@ -305,6 +364,11 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
 
           const goal = store.view()
           if (goal === undefined) return
+          // Claim the goal-and-session pair before submitting, in the same set the
+          // sidebar poll's auto-start reads. Without this the two would disagree:
+          // `ensureSession` navigates the router, so the next poll tick sees a
+          // session and starts the goal again — round 2 for one `/goal`.
+          started.add(`${goal.id}:${id}`)
           try {
             await context.client?.session?.prompt({
               sessionID: id,

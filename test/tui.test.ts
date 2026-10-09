@@ -30,6 +30,10 @@ interface Mock {
   context: TuiGoalContext
   toasts: Toast[]
   prompts: Array<{ sessionID: string; text: string }>
+  /** Every session the plugin asked the client to create. */
+  created: string[]
+  /** Every router navigation the plugin asked for. */
+  navigated: Array<{ type: string; sessionID?: string }>
   slots: SlotClaim[]
   confirms: Array<{ title: string; message: string }>
   objectivePrompts: Array<{ title: string }>
@@ -64,6 +68,8 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
   const holder = { route: initialRoute }
   const toasts: Toast[] = []
   const prompts: Array<{ sessionID: string; text: string }> = []
+  const created: string[] = []
+  const navigated: Array<{ type: string; sessionID?: string }> = []
   const slots: SlotClaim[] = []
   const confirms: Mock['confirms'] = []
   const objectivePrompts: Mock['objectivePrompts'] = []
@@ -78,6 +84,14 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
         prompt: async input => {
           prompts.push({ sessionID: input.sessionID, text: input.text })
           return {}
+        },
+        // The real client's SessionDomain carries `create` (confirmed in
+        // @opencode/plugin's promise/session.d.ts). A mock without it would let
+        // the plugin silently fall back to the old hint.
+        create: async () => {
+          const id = `ses-made-${created.length + 1}`
+          created.push(id)
+          return { id }
         },
       },
     },
@@ -107,7 +121,16 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
         alert: async () => {},
         clear: () => {},
       },
-      router: { current: () => holder.route },
+      router: {
+        current: () => holder.route,
+        // The real router changes route on navigate; a mock that only records
+        // would let the plugin's auto-start see a different session than the one
+        // it just made, and the test would pass for the wrong reason.
+        navigate: (next: { type: string; sessionID?: string }) => {
+          navigated.push(next)
+          holder.route = next
+        },
+      },
       setRoute: (next: TuiRouteRef) => {
         holder.route = next
       },
@@ -115,7 +138,7 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
     },
   }
 
-  return { context, toasts, prompts, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
+  return { context, toasts, prompts, created, navigated, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
 }
 
 /** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
@@ -138,6 +161,8 @@ function setup(route?: TuiRouteRef): Mock {
     context: harness.context,
     toasts: harness.toasts,
     prompts: harness.prompts,
+    created: harness.created,
+    navigated: harness.navigated,
     slots: harness.slots,
     confirms: harness.confirms,
     objectivePrompts: harness.objectivePrompts,
@@ -194,31 +219,45 @@ describe('tui goal command plane', () => {
     expect(harness.layers[0].commands.map(command => command.id)).toContain('goal.command')
   })
 
-  test('a goal created with no session open stays armed but idle, and says why', async () => {
+  test('a goal created with no session open makes a session and starts in it', async () => {
+    // This test changed rather than the code being bent to keep it. What it used
+    // to assert — armed, idle, rounds 0, and a hint — is the defect the human
+    // reported: `/goal` from the home route admitted nothing until a message was
+    // sent. The router does not become a session route until a prompt is
+    // submitted (measured in the opencode binary), so waiting for it was waiting
+    // for the very act the goal exists to remove.
     const mock = setup({ type: 'home' })
     await mock.command('goal.command').run!('work without a session')
 
     const store = new GoalStore(mock.directory)
     expect(store.current?.phase).toBe('active')
-    expect(store.current?.roundsStarted).toBe(0)
-    expect(mock.prompts.length).toBe(0)
-    expect(mock.toasts.some(toast => toast.message.includes('No session is open in this project'))).toBe(true)
+    expect(store.current?.roundsStarted).toBe(1)
+    expect(mock.created.length).toBe(1)
+    expect(mock.prompts.length).toBe(1)
+    expect(mock.prompts[0].sessionID).toBe(mock.created[0])
+    expect(mock.prompts[0].text).toContain('round 1/25')
+    // the human is put in the room the goal is working in, not left on home
+    expect(mock.navigated).toEqual([{ type: 'session', sessionID: mock.created[0] }])
+    expect(mock.toasts.some(toast => toast.message.includes('No session is open in this project'))).toBe(false)
   })
 
-  test('the created goal starts once a session is open and resumed there', async () => {
-    // the TUI half that created the goal without a session
+  test('a goal created from the home route is continued by another instance', async () => {
+    // the TUI half that created the goal without a session. It now makes one and
+    // runs round 1 there, so the second half's resume is round 2 rather than
+    // round 1 — the same cross-instance continuation, one round further on.
     const created = setup({ type: 'home' })
     await created.command('goal.command').run!('work started later')
+    expect(created.prompts.length).toBe(1)
 
-    // a session is now open: `/goal resume` admits and submits round 1
+    // a second TUI half, with a session open: `/goal resume` admits the next round
     const resumed = setup()
     resumed.context.location!.directory = created.directory
     await resumed.command('goal.command').run!('resume')
 
     expect(resumed.prompts.length).toBe(1)
     expect(resumed.prompts[0].sessionID).toBe('ses-goal')
-    expect(resumed.prompts[0].text).toContain('round 1/25')
-    expect(new GoalStore(created.directory).current?.roundsStarted).toBe(1)
+    expect(resumed.prompts[0].text).toContain('round 2/25')
+    expect(new GoalStore(created.directory).current?.roundsStarted).toBe(2)
   })
 
   test('a paused goal is resumed and started by /goal resume', async () => {
@@ -411,12 +450,17 @@ describe('tui goal command plane', () => {
   })
 })
 
-describe('an armed goal starts itself when a session opens', () => {
+describe('the home route: a goal starts without the human sending a message', () => {
   /** A harness whose sidebar poll actually runs, at a 1ms cadence. */
-  function polling(route: TuiRouteRef): Mock {
+  function polling(route: TuiRouteRef, options: { canCreate?: boolean } = {}): Mock {
     const directory = mkdtempSync(join(tmpdir(), 'goal-tui-auto-'))
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
     const harness = makeContext(directory, route)
+    if (options.canCreate === false) {
+      // a client that cannot create a session: the plugin must say so rather
+      // than fall silent after a successful create
+      ;(harness.context.client as { session: Record<string, unknown> }).session.create = undefined
+    }
     const cleanup = createGoalTuiPlugin({ refreshIntervalMs: 1 }).setup(harness.context)
     cleanups.push(cleanup)
     harness.slots.find(claim => claim.append === 'app')?.render({})
@@ -425,6 +469,8 @@ describe('an armed goal starts itself when a session opens', () => {
       context: harness.context,
       toasts: harness.toasts,
       prompts: harness.prompts,
+      created: harness.created,
+      navigated: harness.navigated,
       slots: harness.slots,
       confirms: harness.confirms,
       objectivePrompts: harness.objectivePrompts,
@@ -442,19 +488,21 @@ describe('an armed goal starts itself when a session opens', () => {
     for (let i = 0; i < count; i++) await new Promise(resolve => setTimeout(resolve, 4))
   }
 
-  test('a goal created with no session open starts when one is opened', async () => {
-    // The reported defect: `/goal create` from the home route has no session to
-    // run in, so the command plane showed a hint and admitted nothing. Opening a
-    // session then had to start it, and nothing reacted to that.
+  test('a goal that predates the session starts when one is opened', async () => {
+    // What this used to assert was the reported defect: `/goal create` from the
+    // home route admitted nothing until a session opened. That case now makes its
+    // own session (see the test above), so what is left to prove here is the other
+    // half — a goal that already existed, written by some other writer, started by
+    // opening a session. That is ticket 26's case and it is still real.
     const home = { type: 'home' } as TuiRouteRef
     const harness = polling(home)
     try {
-      // create the goal through the command plane, so it is created by the same
-      // store instance the plugin polls — a store that came alive beside an
-      // existing goal reads as disarmed, which is correct and is also why the
-      // auto-start must not fire for one
-      await harness.command('goal.command').run!('auto objective')
-      harness.prompts.length = 0
+      // a goal written by another writer, so this plugin's store is born beside
+      // it and reads as disarmed — which is correct, and is why the auto-start
+      // has to arm before it kicks
+      const writer = new GoalStore(harness.directory)
+      writer.create('auto objective', 25, 0)
+
       await ticks()
       expect(harness.prompts.length).toBe(0) // no session yet: nothing to run in
 
@@ -473,13 +521,71 @@ describe('an armed goal starts itself when a session opens', () => {
     }
   })
 
+  /**
+   * The opencode binary navigates to `{type:"session"}` inside the prompt-submit
+   * handler — `if (!i.sessionID) { ...; V.navigate({type:"session", sessionID: Br}) }`
+   * — so a session created by `<leader>n` does not put the router on a session
+   * route. Waiting for the route is therefore waiting for the very thing the goal
+   * exists to remove, which is why the human had to type a message to start it.
+   */
+  test('/goal with no session open makes one instead of asking the human to', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      await harness.command('goal.command').run!('make a session for me')
+      await ticks()
+
+      // a session was created, and the round ran in it
+      expect(harness.created.length).toBe(1)
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts[0].sessionID).toBe(harness.created[0])
+      expect(harness.prompts[0].text).toContain('round 1/25')
+      // and the human was put in the room the goal is working in
+      expect(harness.navigated).toEqual([{ type: 'session', sessionID: harness.created[0] }])
+      // the hint is gone: the human is not asked to do the thing the goal does
+      expect(harness.toasts.some(t => t.message.includes('No session is open'))).toBe(false)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a session that is already open is used, not replaced', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-existing' })
+    try {
+      await harness.command('goal.command').run!('use the open session')
+      await ticks()
+      expect(harness.created.length).toBe(0)
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts[0].sessionID).toBe('ses-existing')
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a client that cannot create a session still says so, rather than going silent', async () => {
+    const harness = polling({ type: 'home' }, { canCreate: false })
+    try {
+      await harness.command('goal.command').run!('no client here')
+      await ticks()
+      expect(harness.created.length).toBe(0)
+      expect(harness.prompts.length).toBe(0)
+      expect(harness.toasts.some(t => t.message.includes('No session is open'))).toBe(true)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
   test('it starts once, not once per poll', async () => {
+    // This assertion used to be `toBe(1)` after clearing the prompts, which
+    // measured the auto-start firing a *second* round for one `/goal` — a double
+    // kick the poll and the command plane both performed. The command plane now
+    // claims the goal-and-session pair in the set the poll reads, so one create is
+    // one round.
     const harness = polling({ type: 'session', sessionID: 'ses-once' })
     try {
       await harness.command('goal.command').run!('once objective')
-      harness.prompts.length = 0
       await ticks(20)
       expect(harness.prompts.length).toBe(1)
+      expect(new GoalStore(harness.directory).current?.roundsStarted).toBe(1)
     } finally {
       // handled by cleanups
     }
