@@ -354,3 +354,110 @@ describe('a finished human turn re-arms a goal that predates the process', () =>
     expect(promptCalls.length).toBe(before)
   })
 })
+
+describe('a turn that never reached the provider', () => {
+  // The recorded DNS failure, verbatim from the human's own goal log:
+  // `provider.transport`, no status, and a message naming the resolver.
+  const DNS_FAILURE = { type: 'provider.transport', message: 'getaddrinfo ENOTFOUND api.stepfun.com' }
+
+  test('one failure is ridden out and the goal keeps working', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-transport-'))
+    const st = new GoalStore(directory)
+    st.create('transport objective', 5, 0)
+    const { driver } = makeDriver(st, directory)
+    const before = promptCalls.length
+
+    await driver.onSessionCreated('session-transport', directory)
+    expect(promptCalls.length).toBe(before + 1)
+
+    // the request never arrived, so there is no refusal to record and the goal
+    // carries on rather than stopping for a dropped connection
+    await driver.onTurnFinished('session-transport', directory, undefined, DNS_FAILURE)
+    expect(st.view()?.phase).toBe('active')
+    expect(promptCalls.length).toBe(before + 2)
+    expect(st.view()?.roundsStarted).toBe(2)
+  })
+
+  test('a sustained outage stops durably, with a code that names the network', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-outage-'))
+    const st = new GoalStore(directory)
+    st.create('outage objective', 10, 0)
+    const { driver } = makeDriver(st, directory)
+    const before = promptCalls.length
+
+    await driver.onSessionCreated('session-outage', directory)
+    for (let i = 0; i < 3; i++) {
+      await driver.onTurnFinished('session-outage', directory, undefined, DNS_FAILURE)
+    }
+
+    expect(st.view()?.phase).toBe('blocked')
+    expect(st.view()?.blockedReason?.code).toBe('provider-unavailable')
+    expect(st.view()?.blockedReason?.message).toContain('getaddrinfo ENOTFOUND')
+    // and it did not spend the whole cap trying
+    expect(st.view()!.roundsStarted).toBeLessThan(10)
+    // Three rounds were admitted, not one: the limit is three consecutive
+    // failures, so the third round is the third attempt and its prompt was
+    // submitted before its turn failed. Stopping on the first failure is exactly
+    // the behaviour this change removes.
+    expect(promptCalls.length).toBe(before + 3)
+    expect(st.view()!.roundsStarted).toBe(3)
+  })
+
+  test('a turn that got through resets the streak', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-recover-'))
+    const st = new GoalStore(directory)
+    st.create('recover objective', 10, 0)
+    const { driver } = makeDriver(st, directory)
+
+    await driver.onSessionCreated('session-recover', directory)
+    await driver.onTurnFinished('session-recover', directory, undefined, DNS_FAILURE)
+    await driver.onTurnFinished('session-recover', directory, undefined, DNS_FAILURE)
+    // a working turn in between means the failures were not consecutive
+    await driver.onTurnFinished('session-recover', directory)
+    await driver.onTurnFinished('session-recover', directory, undefined, DNS_FAILURE)
+    await driver.onTurnFinished('session-recover', directory, undefined, DNS_FAILURE)
+
+    expect(st.view()?.phase).toBe('active')
+    expect(st.view()?.blockedReason).toBeUndefined()
+  })
+
+  test('a real refusal still stops on the first breach', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-refusal-'))
+    const st = new GoalStore(directory)
+    st.create('refusal objective', 10, 0)
+    const { driver } = makeDriver(st, directory)
+
+    await driver.onSessionCreated('session-refusal', directory)
+    await driver.onTurnFinished('session-refusal', directory, undefined, {
+      type: 'provider.auth',
+      message: 'An active OpenCode Go subscription is required to use Go models.',
+      status: 403,
+    })
+
+    // the two must not collapse: a subscription problem and a dead network need
+    // different human action, and one stops immediately while the other is ridden out
+    expect(st.view()?.phase).toBe('blocked')
+    expect(st.view()?.blockedReason?.code).toBe('usage-limited')
+    expect(st.view()?.blockedReason?.message).toContain('HTTP 403')
+  })
+
+  test('a failed turn is not a turn that talked without acting', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-driver-stall-'))
+    const st = new GoalStore(directory)
+    // the default stall limit is 2, which is what made a network outage stop the
+    // goal as `no-tool-call` before this change
+    st.create('stall objective', 10, 0)
+    const { driver, accounting } = makeDriver(st, directory)
+
+    await driver.onSessionCreated('session-stall', directory)
+    for (let i = 0; i < 4; i++) {
+      accounting.onTurnEnded(directory, 'session-stall', true)
+      await driver.onTurnFinished('session-stall', directory, undefined, DNS_FAILURE)
+    }
+
+    expect(st.view()?.phase).toBe('blocked')
+    expect(st.view()?.blockedReason?.code).toBe('provider-unavailable')
+    // never the stall guard, which is a claim about the model's behaviour
+    expect(st.view()?.blockedReason?.code).not.toBe('no-tool-call')
+  })
+})

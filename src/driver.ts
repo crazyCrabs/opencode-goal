@@ -43,7 +43,14 @@ import { randomUUID } from 'node:crypto'
 import type { GoalStore } from './state.ts'
 import type { GoalView } from './types.ts'
 import { admitRound, stopGoal } from './admission.ts'
-import { providerStopReason, renderGoalRoundPrompt } from './round-policy.ts'
+import {
+  isTransportFailure,
+  providerStopReason,
+  renderGoalRoundPrompt,
+  transportFailureReason,
+  transportMessage,
+  TRANSPORT_FAILURE_LIMIT,
+} from './round-policy.ts'
 
 /**
  * How long a round lease survives without a renewal.
@@ -321,14 +328,39 @@ export class GoalDriver {
     // used to disarm the goal instead, which left it reading `active` in the log
     // with nothing saying why it had gone quiet, and a restart re-armed it into
     // the same refusal.
+    //
+    // A transport failure is deliberately not that. The request never arrived, so
+    // there is no refusal to record and the goal carries on — one dropped
+    // connection must not stop a goal that was making progress. What stops it is a
+    // sustained outage, counted separately, with a code that names the network.
     const stop = providerStopReason(error)
     if (stop !== undefined) {
+      store.noteTransportSuccess()
       if (stopGoal(store, stop)) {
         this.hooks.log(`goal blocked: ${stop.code}`, { sessionID, directory })
       } else {
         this.hooks.log('goal provider stop skipped: another writer moved the goal', { sessionID })
       }
       return
+    }
+    if (isTransportFailure(error)) {
+      store.noteTransportFailure()
+      const goal = store.view()
+      if (goal !== undefined && store.transportFailureCount >= TRANSPORT_FAILURE_LIMIT) {
+        const reason = transportFailureReason(store.transportFailureCount, transportMessage(error))
+        if (stopGoal(store, reason)) {
+          this.hooks.log(`goal blocked: ${reason.code}`, { sessionID, directory })
+        } else {
+          this.hooks.log('goal transport stop skipped: another writer moved the goal', { sessionID })
+        }
+        return
+      }
+      this.hooks.log(
+        `goal turn failed to reach the provider (${store.transportFailureCount}/${TRANSPORT_FAILURE_LIMIT}); carrying on`,
+        { sessionID },
+      )
+    } else {
+      store.noteTransportSuccess()
     }
     await this.drive(store, sessionID, directory)
   }

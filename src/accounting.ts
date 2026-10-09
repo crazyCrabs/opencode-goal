@@ -219,9 +219,18 @@ export class GoalAccounting {
     store.noteToolCall()
   }
 
-  onTurnEnded(directory: string, sessionID: string): void {
+  onTurnEnded(directory: string, sessionID: string, failed = false): void {
     const store = this.hooks.storeFor(directory)
     if (store.view() === undefined) {
+      this.toolCallThisTurn.delete(sessionID)
+      return
+    }
+    // A turn that never ran is not a turn that talked without acting. "The goal is
+    // talking without acting" is a claim about the model's behaviour, and a turn
+    // that failed to reach the provider says nothing about it — counting one means
+    // a network outage eventually stops the goal as `no-tool-call`, which is a
+    // second wrong code for the same cause.
+    if (failed) {
       this.toolCallThisTurn.delete(sessionID)
       return
     }

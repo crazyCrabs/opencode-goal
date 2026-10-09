@@ -242,6 +242,16 @@ interface RuntimeState {
    * failure the second one exists for.
    */
   turnsWithoutToolCall: number
+  /**
+   * Consecutive turns that failed to reach the provider at all.
+   *
+   * Separate from `turnsWithoutToolCall` because the two count different
+   * things: a tool-less turn is a model that talked without acting, and a turn
+   * that never ran says nothing about the model. Folding them together means a
+   * network outage eventually stops the goal as `no-tool-call`, which is a second
+   * wrong code for the same cause.
+   */
+  transportFailures: number
   /** Normalized assistant outputs of recent goal rounds (no-progress guard). */
   recentOutputs: string[]
   /**
@@ -263,6 +273,7 @@ function emptyRuntime(): RuntimeState {
   return {
     activation: 'disarmed',
     turnsWithoutToolCall: 0,
+    transportFailures: 0,
     recentOutputs: [],
     recentJudgments: [],
     judgmentThisRound: false,
@@ -540,6 +551,7 @@ export class GoalStore {
   resetStallCounters(): void {
     this.runtime.recentOutputs.length = 0
     this.runtime.turnsWithoutToolCall = 0
+    this.runtime.transportFailures = 0
   }
 
   /**
@@ -568,6 +580,27 @@ export class GoalStore {
   /** Consecutive turns that have now ended with no tool call at all. */
   get turnsWithoutToolCallCount(): number {
     return this.runtime.turnsWithoutToolCall
+  }
+
+  /**
+   * Note that a turn failed to reach the provider at all.
+   *
+   * Its own counter, reset by any turn that did get through, so the streak is
+   * genuinely consecutive. A goal that alternates between a working and a broken
+   * connection never reaches the limit, which is right: it is making progress.
+   */
+  noteTransportFailure(): void {
+    this.runtime.transportFailures += 1
+  }
+
+  /** Note that a turn reached the provider, so the outage streak is over. */
+  noteTransportSuccess(): void {
+    this.runtime.transportFailures = 0
+  }
+
+  /** Consecutive turns that have now failed to reach the provider at all. */
+  get transportFailureCount(): number {
+    return this.runtime.transportFailures
   }
 
   /** Whether the goal has now stalled by talking without acting. */

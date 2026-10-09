@@ -53,6 +53,42 @@ export function renderGoalRoundPrompt(goal: GoalView, round: number): string {
 const REFUSAL_STATUSES: ReadonlySet<number> = new Set([401, 402, 403, 408, 429])
 
 /**
+ * The error type that means the request never reached a provider.
+ *
+ * Measured twice: a DNS failure arrived as `provider.transport` with no status and
+ * `getaddrinfo ENOTFOUND api.stepfun.com`, while a real refusal arrived as
+ * `provider.auth` with `status: 403` and "An active OpenCode Go subscription is
+ * required". The first never got an answer; the second did, and the answer was no.
+ */
+const TRANSPORT_ERROR_TYPE = 'provider.transport'
+
+/**
+ * Connection-level failures, recognised from the message when the type is absent
+ * or too generic to say. These are the shapes a fetch throws when the socket never
+ * opened, and they are all transient in the same way.
+ */
+const TRANSPORT_MARKERS: readonly string[] = [
+  'ENOTFOUND',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EPIPE',
+  'socket hang up',
+  'fetch failed',
+  'network',
+  'terminated', // undici's `terminated` for a socket closed mid-request
+]
+
+/** Whether a type and message describe a connection that never opened. */
+function namesConnection(type: string, message: string): boolean {
+  if (type === TRANSPORT_ERROR_TYPE) return true
+  const lowered = message.toLowerCase()
+  return TRANSPORT_MARKERS.some(marker => lowered.includes(marker.toLowerCase()))
+}
+
+/**
  * Classify a failed turn's error into a stop, or undefined when the failure is
  * not a provider refusal and the goal may carry on.
  *
@@ -83,6 +119,18 @@ function field(source: unknown, key: string): unknown {
  * The event shape is `{ type: string, message: string, status?: number }`,
  * declared by `@opencode/protocol` and confirmed by a live 403
  * (`provider.auth`, "An active OpenCode Go subscription is required", 403).
+ *
+ * The distinction this turns on is **whether a provider answered**. A status in
+ * the refusal set, or a provider-family error with no status that is not a
+ * transport failure, is an answer: no, and only a human can change it. A
+ * transport failure is not an answer at all — the request never arrived — and
+ * stopping a goal for one loses work the next attempt would have finished.
+ *
+ * The fallback branch used to contradict that. It sent every status-less
+ * `provider.*` error down the stop path, and `provider.transport` is a status-less
+ * `provider.*` error, so a DNS failure stopped the goal as `usage-limited` with
+ * "the provider refused the request" — a provider that was never reached, and a
+ * diagnosis that sent the human to their subscription instead of their network.
  */
 export function providerStopReason(error: unknown): GoalBlockReason | undefined {
   if (error === undefined || error === null) return undefined
@@ -90,17 +138,48 @@ export function providerStopReason(error: unknown): GoalBlockReason | undefined 
   const status = typeof rawStatus === 'number' && Number.isFinite(rawStatus) ? rawStatus : undefined
   const type = typeof field(error, 'type') === 'string' ? (field(error, 'type') as string) : ''
   if (status !== undefined && !REFUSAL_STATUSES.has(status)) return undefined
+  const rawMessage = field(error, 'message')
+  const message = typeof rawMessage === 'string' ? rawMessage.trim() : ''
+  // a connection that never opened is not a refusal, whatever family the error
+  // claims: there is nobody on the other end to have refused anything
+  if (status === undefined && namesConnection(type, message)) return undefined
   // a provider-family error with no status is still a refusal nobody can retry
   // past, but an untyped error with no status is not classifiable at all
   if (status === undefined && !type.startsWith('provider.')) return undefined
-  const rawMessage = field(error, 'message')
-  const message = typeof rawMessage === 'string' && rawMessage.trim().length > 0
-    ? rawMessage.trim()
-    : 'the provider refused the request'
   const kind = status !== undefined ? `HTTP ${status}` : type
   return {
     code: 'usage-limited',
-    message: `Goal stopped: the provider refused the request (${kind}): ${message}`,
+    message: `Goal stopped: the provider refused the request (${kind}): ${message.length > 0 ? message : 'the provider refused the request'}`,
+  }
+}
+
+/**
+ * How many consecutive transport failures stop a goal.
+ *
+ * One dropped connection is ridden out — that is what
+ * `providerStopReason` returning undefined buys. A sustained outage is not, and
+ * without a limit of its own the goal would burn its whole round cap on requests
+ * that never arrive. Three is the same patience the judgment tier asks of a
+ * model's own claim, applied to a fact about the network.
+ */
+export const TRANSPORT_FAILURE_LIMIT = 3
+
+/**
+ * The stop a sustained transport failure raises.
+ *
+ * Its own code rather than `usage-limited`, because the two need different human
+ * action: a subscription is changed in an account, a network is fixed on a
+ * machine, and telling someone to do the first when the second is true wastes
+ * their time. It is arithmetic — the connection has failed three times, which has
+ * already happened — so it stops on the first breach.
+ */
+export function transportFailureReason(count: number, message: string): GoalBlockReason {
+  return {
+    code: 'provider-unavailable',
+    message:
+      `Goal stopped: the provider could not be reached ${count} times in a row ` +
+      `(${message.length > 0 ? message : 'no connection'}). The requests never arrived, ` +
+      'so this is a network or provider outage rather than a quota or subscription problem.',
   }
 }
 
@@ -133,6 +212,8 @@ const BLOCK_TIERS: Readonly<Record<GoalBlockCode, BlockTier>> = {
   'round-limit': 'arithmetic',
   'budget-limited': 'arithmetic',
   'usage-limited': 'arithmetic',
+  // the connection has failed three times, which has already happened
+  'provider-unavailable': 'arithmetic',
   'wait-expired': 'arithmetic',
 }
 
@@ -212,4 +293,28 @@ export function goalBlockReason(store: GoalStore, goal: GoalView): GoalBlockReas
     }
   }
   return undefined
+}
+
+/**
+ * Whether an error describes a connection that never opened, for callers that
+ * already know it is not a refusal.
+ *
+ * Exported because the driver counts these separately from refusals, and the two
+ * questions have to be answered by the same rule or they drift: a failure the
+ * classifier rides out must be the same failure the counter counts.
+ */
+export function isTransportFailure(error: unknown): boolean {
+  if (error === undefined || error === null) return false
+  const type = typeof field(error, 'type') === 'string' ? (field(error, 'type') as string) : ''
+  const raw = field(error, 'message')
+  const message = typeof raw === 'string' ? raw.trim() : ''
+  if (type.length > 0 && !type.startsWith('provider.')) return false
+  return namesConnection(type, message)
+}
+
+/** The message off an error, or empty when it carries none. */
+export function transportMessage(error: unknown): string {
+  if (error === undefined || error === null) return ''
+  const raw = field(error, 'message')
+  return typeof raw === 'string' ? raw.trim() : ''
 }

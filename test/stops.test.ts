@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { admitRound, stopGoal } from '../src/admission.ts'
-import { providerStopReason } from '../src/round-policy.ts'
+import { blockTier, providerStopReason, TRANSPORT_FAILURE_LIMIT, transportFailureReason } from '../src/round-policy.ts'
 import { GoalStore } from '../src/state.ts'
 import type { GoalPhase } from '../src/types.ts'
 
@@ -191,5 +191,66 @@ describe('a stop is durable, not process-local', () => {
     expect(stopGoal(store, providerStopReason(LIVE_REFUSAL)!)).toBe(false)
     // and the rival's stop is the one that stands
     expect(store.view()!.blockedReason?.code).toBe('no-progress')
+  })
+})
+
+describe('a transport failure is not a refusal', () => {
+  // The recorded DNS failure: `provider.transport`, no status, and a message that
+  // names the resolver. The provider never answered, so there is no refusal.
+  const LIVE_DNS_FAILURE = {
+    type: 'provider.transport',
+    message: 'getaddrinfo ENOTFOUND api.stepfun.com',
+  }
+
+  test('the recorded DNS failure is not a stop', () => {
+    expect(providerStopReason(LIVE_DNS_FAILURE)).toBeUndefined()
+  })
+
+  test('the recorded 403 still is one', () => {
+    // the two shapes must not collapse: a subscription problem and a dead network
+    // need different human action
+    const reason = providerStopReason(LIVE_REFUSAL)
+    expect(reason?.code).toBe('usage-limited')
+    expect(reason?.message).toContain('OpenCode Go subscription')
+  })
+
+  test('every connection-level marker is ridden out', () => {
+    for (const marker of ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH', 'socket hang up', 'fetch failed']) {
+      expect(providerStopReason({ type: 'provider.whatever', message: `upstream: ${marker}` })).toBeUndefined()
+    }
+  })
+
+  test('a status in the refusal set still stops, whatever the message says', () => {
+    // a 403 whose message happens to mention the network is still a refusal: the
+    // status is the provider answering, and it answered no
+    expect(providerStopReason({ type: 'provider.auth', message: 'ECONNRESET while reading the body', status: 403 })?.code)
+      .toBe('usage-limited')
+  })
+
+  test('a non-refusal status is still left alone', () => {
+    expect(providerStopReason({ type: 'provider.transport', message: 'boom', status: 500 })).toBeUndefined()
+  })
+
+  test('a sustained outage stops with a code that names the network', () => {
+    const reason = transportFailureReason(TRANSPORT_FAILURE_LIMIT, LIVE_DNS_FAILURE.message)
+    expect(reason.code).toBe('provider-unavailable')
+    expect(reason.message).toContain('getaddrinfo ENOTFOUND')
+    expect(reason.message).toContain('never arrived')
+    // and it must not read as a refusal: the provider never answered, so there is
+    // nothing it could have refused. The word "subscription" does appear, but only
+    // to rule that diagnosis out — which is the point of a separate code.
+    expect(reason.message).not.toContain('refused')
+    expect(reason.message).not.toContain('HTTP')
+  })
+
+  test('provider-unavailable is arithmetic: a fact, not a judgment', () => {
+    expect(blockTier('provider-unavailable')).toBe('arithmetic')
+  })
+
+  test('the two error shapes are told apart by the classifier alone', () => {
+    const dns = providerStopReason(LIVE_DNS_FAILURE)
+    const refused = providerStopReason(LIVE_REFUSAL)
+    expect(dns).toBeUndefined()
+    expect(refused).toBeDefined()
   })
 })

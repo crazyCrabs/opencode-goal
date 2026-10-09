@@ -127,6 +127,8 @@ export type GoalBlockCode =
   | 'no-tool-call'
   /** The provider refused to serve the goal (quota, auth, rate limit). */
   | 'usage-limited'
+  /** The provider could not be reached at all: the request never arrived. */
+  | 'provider-unavailable'
   /** An external wait whose deadline passed while nothing woke it. */
   | 'wait-expired'
 
