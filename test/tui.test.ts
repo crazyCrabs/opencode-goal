@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createComponent, createRoot } from 'solid-js'
@@ -34,6 +34,12 @@ interface Mock {
   created: string[]
   /** Every router navigation the plugin asked for. */
   navigated: Array<{ type: string; sessionID?: string }>
+  /** Every model a `create` was given. */
+  madeWith: Array<{ providerID: string; id: string } | undefined>
+  /** Every session id a `get` was asked about. */
+  lookedUp: string[]
+  /** The sessions that still exist, and the model each resolves to. */
+  liveSessions: Map<string, { providerID: string; id: string } | undefined>
   slots: SlotClaim[]
   confirms: Array<{ title: string; message: string }>
   objectivePrompts: Array<{ title: string }>
@@ -70,6 +76,12 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
   const prompts: Array<{ sessionID: string; text: string }> = []
   const created: string[] = []
   const navigated: Array<{ type: string; sessionID?: string }> = []
+  /** Every model a `create` was given, so a test can prove the remembered one rode along. */
+  const madeWith: Array<{ providerID: string; id: string } | undefined> = []
+  /** Every session id a `get` was asked about. */
+  const lookedUp: string[] = []
+  /** The sessions that still exist, and the model each resolves to. */
+  const liveSessions = new Map<string, { providerID: string; id: string } | undefined>()
   const slots: SlotClaim[] = []
   const confirms: Mock['confirms'] = []
   const objectivePrompts: Mock['objectivePrompts'] = []
@@ -88,10 +100,19 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
         // The real client's SessionDomain carries `create` (confirmed in
         // @opencode/plugin's promise/session.d.ts). A mock without it would let
         // the plugin silently fall back to the old hint.
-        create: async () => {
+        create: async (input?: { model?: { providerID: string; id: string } }) => {
           const id = `ses-made-${created.length + 1}`
           created.push(id)
+          madeWith.push(input?.model)
           return { id }
+        },
+        // A remembered session is looked up here. Throwing is how a session that
+        // no longer exists reports itself, which is the case the recovery path
+        // exists for.
+        get: async (input: { sessionID: string }) => {
+          lookedUp.push(input.sessionID)
+          if (!liveSessions.has(input.sessionID)) throw new Error('session not found')
+          return { id: input.sessionID, model: liveSessions.get(input.sessionID) }
         },
       },
     },
@@ -99,7 +120,7 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
       on: () => () => {
         unsubscribed = true
       },
-      session: { status: () => state.status },
+      session: { status: () => state.status, get: (id: string) => ({ id, model: liveSessions.get(id) }) },
     },
     keymap: {
       // the real TUI owns the layer for the calling component's lifetime
@@ -138,7 +159,7 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
     },
   }
 
-  return { context, toasts, prompts, created, navigated, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
+  return { context, toasts, prompts, created, navigated, madeWith, lookedUp, liveSessions, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
 }
 
 /** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
@@ -163,6 +184,9 @@ function setup(route?: TuiRouteRef): Mock {
     prompts: harness.prompts,
     created: harness.created,
     navigated: harness.navigated,
+    madeWith: harness.madeWith,
+    lookedUp: harness.lookedUp,
+    liveSessions: harness.liveSessions,
     slots: harness.slots,
     confirms: harness.confirms,
     objectivePrompts: harness.objectivePrompts,
@@ -470,6 +494,9 @@ function polling(route: TuiRouteRef, options: { canCreate?: boolean } = {}): Moc
     prompts: harness.prompts,
     created: harness.created,
     navigated: harness.navigated,
+    madeWith: harness.madeWith,
+    lookedUp: harness.lookedUp,
+    liveSessions: harness.liveSessions,
     slots: harness.slots,
     confirms: harness.confirms,
     objectivePrompts: harness.objectivePrompts,
@@ -680,5 +707,133 @@ describe('a blocked goal says why, without the human opening the log', () => {
     } finally {
       // handled by cleanups
     }
+  })
+})
+
+describe('the goal remembers its room, and the model that room ran on', () => {
+  /**
+   * Put the router back on the home route.
+   *
+   * After a round runs, `ensureSession` has navigated to the session it made, so
+   * the next `/goal` finds a session open and reuses it — which is the happy path
+   * and not what these tests are about. A recovery is only reachable from home:
+   * the human navigated away, or the process restarted.
+   */
+  function backHome(harness: Mock): void {
+    ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({ type: 'home' })
+  }
+
+  test('a round records the session it ran in and the model it resolved to', async () => {
+    const mock = setup()
+    mock.liveSessions.set('ses-goal', { providerID: 'stepfun', id: 'step-5-preview' })
+    await mock.command('goal.command').run!('remember my room')
+
+    const store = new GoalStore(mock.directory)
+    expect(store.session?.sessionID).toBe('ses-goal')
+    expect(store.session?.model).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+  })
+
+  test('a session coordinate is not a state verb: it does not move the revision', async () => {
+    const mock = setup()
+    await mock.command('goal.command').run!('coordinate only')
+    const before = new GoalStore(mock.directory).view()!
+    expect(before.revision).toBe(2) // create + continue
+
+    // remembering a session again, for the same room, must not bump anything
+    const writer = new GoalStore(mock.directory)
+    writer.rememberSession({ id: before.id, revision: before.revision }, 'ses-goal', { providerID: 'opencode', id: 'mimo' })
+    const after = new GoalStore(mock.directory).view()!
+    expect(after.revision).toBe(before.revision)
+    expect(after.roundsStarted).toBe(before.roundsStarted)
+  })
+
+  test('a remembered session that still exists is reused, and no new one is made', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      await harness.command('goal.command').run!('first run')
+      await ticks()
+      const firstRoom = harness.created[0]
+      expect(harness.madeWith).toEqual([undefined]) // a first goal has nothing to remember
+
+      // the human navigates away, the room is still alive, and they resume
+      backHome(harness)
+      harness.liveSessions.set(firstRoom, { providerID: 'stepfun', id: 'step-5-preview' })
+      await harness.command('goal.command').run!('resume')
+      await ticks()
+
+      expect(harness.lookedUp).toContain(firstRoom)
+      expect(harness.created.length).toBe(1) // the same room, not a new one
+      expect(harness.prompts[harness.prompts.length - 1].sessionID).toBe(firstRoom)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a remembered session that is gone is replaced, carrying its model', async () => {
+    // The first round runs in a session that is already open, so the model is read
+    // from a room the human actually chose it in. An earlier version of this test
+    // started from the home route and set the model on a session the goal never
+    // used, so the goal correctly remembered no model and the test proved nothing.
+    const harness = polling({ type: 'session', sessionID: 'ses-goal' })
+    try {
+      harness.liveSessions.set('ses-goal', { providerID: 'stepfun', id: 'step-5-preview' })
+      await harness.command('goal.command').run!('will lose its room')
+      await ticks()
+      expect(harness.created.length).toBe(0) // it used the open session
+      expect(new GoalStore(harness.directory).session?.model).toEqual({
+        providerID: 'stepfun',
+        id: 'step-5-preview',
+      })
+
+      // the human navigates away and closes that session, then resumes: the goal
+      // must not fall back to whatever the server defaults to, which for at least
+      // one account is a model it cannot use at all
+      backHome(harness)
+      harness.liveSessions.delete('ses-goal')
+      await harness.command('goal.command').run!('resume')
+      await ticks()
+
+      expect(harness.created.length).toBe(1)
+      // the replacement was created WITH the remembered model
+      expect(harness.madeWith[0]).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+      expect(harness.prompts[harness.prompts.length - 1].sessionID).toBe(harness.created[0])
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a goal with no remembered model still runs, on whatever the server picks', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      // no model anywhere: the honest case, which fails with usage-limited and is
+      // announced rather than silently guessed at
+      await harness.command('goal.command').run!('no model anywhere')
+      await ticks()
+      backHome(harness)
+      await harness.command('goal.command').run!('resume')
+      await ticks()
+
+      expect(harness.created.length).toBe(2)
+      expect(harness.madeWith[1]).toBeUndefined()
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('the goal log carries the room as its own line kind', async () => {
+    const mock = setup()
+    mock.liveSessions.set('ses-goal', { providerID: 'stepfun', id: 'step-5-preview' })
+    await mock.command('goal.command').run!('line kind')
+
+    const lines = readFileSync(join(mock.directory, '.opencode', 'goal-log.jsonl'), 'utf8')
+      .split('\n')
+      .filter(line => line.trim().length > 0)
+      .map(line => JSON.parse(line))
+    const sessions = lines.filter(line => line['kind'] === 'goal/session')
+    expect(sessions.length).toBe(1)
+    expect(sessions[0].sessionID).toBe('ses-goal')
+    // and it is not a state verb: no `operation`, and it did not become a round
+    expect(sessions[0].operation).toBeUndefined()
+    expect(lines.filter(line => line['operation'] === 'continue').length).toBe(1)
   })
 })

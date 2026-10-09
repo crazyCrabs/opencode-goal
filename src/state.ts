@@ -34,11 +34,13 @@ import {
   type GoalUsage,
   type GoalView,
   type GoalLeaseChangeMeta,
+  type GoalSessionChangeMeta,
   type GoalLogLine,
 } from './types.ts'
 
 const GOAL_CHANGE_VERSION = 1
 const GOAL_LEASE_VERSION = 1
+const GOAL_SESSION_VERSION = 1
 
 /** Coerce a possibly-missing legacy `tokenBudget` field into the durable shape. */
 function normalizeSnapshot(snapshot: GoalSnapshot): GoalSnapshot {
@@ -88,9 +90,20 @@ function sameLease(a: GoalLeaseChangeMeta | undefined, b: GoalLeaseChangeMeta | 
   return a.id === b.id && a.holder === b.holder && a.expiresAt === b.expiresAt
 }
 
+/** Whether two folded session coordinates are the same session and model. */
+function sameSession(a: GoalSessionChangeMeta | undefined, b: GoalSessionChangeMeta | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.id === b.id && a.sessionID === b.sessionID && a.model?.id === b.model?.id && a.model?.providerID === b.model?.providerID
+}
+
 /** Whether a fold holds nothing any reader of this store depends on. */
 function unchangedFold(a: GoalFoldState, b: GoalFoldState): boolean {
-  return sameGoal(a.goal, b.goal) && sameUsage(a.goal, b.goal) && sameLease(a.lease, b.lease)
+  return (
+    sameGoal(a.goal, b.goal) &&
+    sameUsage(a.goal, b.goal) &&
+    sameLease(a.lease, b.lease) &&
+    sameSession(a.session, b.session)
+  )
 }
 
 /** Fold state rebuilt from the log. */
@@ -104,6 +117,11 @@ export interface GoalFoldState {
    * at read time, so a holder's death is visible without rewriting history.
    */
   readonly lease: GoalLeaseChangeMeta | undefined
+  /**
+   * The session the goal last worked in, and the model it resolved to. A
+   * coordinate like the lease: the fold never counts it as a state verb.
+   */
+  readonly session: GoalSessionChangeMeta | undefined
 }
 
 /**
@@ -122,6 +140,7 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
   let lastRef: GoalRef | undefined
   let usage: GoalUsage = EMPTY_USAGE
   let lease: GoalLeaseChangeMeta | undefined
+  let session: GoalSessionChangeMeta | undefined
   /** The goal the usage accumulator belongs to. */
   let usageGoalID: string | undefined
   /** Whether a delta has already been folded for `usageGoalID`. */
@@ -140,6 +159,13 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
     // applied, so one writer's lease cannot hold another goal's round.
     if (parsed.kind === 'goal/lease') {
       if (goal !== undefined && parsed.id === goal.id) lease = parsed
+      continue
+    }
+    // The session coordinate is folded the same way: its own slot, and a line
+    // naming another goal is dropped so one writer's session cannot hold
+    // another goal's room.
+    if (parsed.kind === 'goal/session') {
+      if (goal !== undefined && parsed.id === goal.id) session = parsed
       continue
     }
     const change = parsed
@@ -165,6 +191,8 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
       usageFromDelta = false
       // a cleared goal has no round to own, so its lease goes with it
       lease = undefined
+      // and no room to work in
+      session = undefined
     } else {
       goal = normalizeSnapshot(change.goal)
       lastRef = { id: change.goal.id, revision: change.goal.revision }
@@ -191,6 +219,7 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
     goal: goal === undefined ? undefined : { ...goal, usage },
     lastRef,
     lease,
+    session,
   }
 }
 
@@ -252,7 +281,7 @@ export class GoalStore {
   constructor(worktree: string) {
     this.logPath = `${worktree}/.opencode/goal-log.jsonl`
     this.runtime = emptyRuntime()
-    this.state = { goal: undefined, lastRef: undefined, lease: undefined }
+    this.state = { goal: undefined, lastRef: undefined, lease: undefined, session: undefined }
     if (existsSync(this.logPath)) {
       const lines = readFileSync(this.logPath, 'utf8').split('\n')
       this.state = foldGoalLog(lines)
@@ -290,7 +319,7 @@ export class GoalStore {
     if (!existsSync(this.logPath)) {
       const previous = this.state.goal
       if (previous === undefined) return
-      this.state = { goal: undefined, lastRef: this.state.lastRef, lease: this.state.lease }
+      this.state = { goal: undefined, lastRef: this.state.lastRef, lease: this.state.lease, session: this.state.session }
       // the goal is gone: that is a state verb, whatever removed it
       this.applyExternalChange(previous, undefined, true)
       return
@@ -649,11 +678,16 @@ export class GoalStore {
     appendFileSync(this.logPath, `${JSON.stringify(change)}\n`)
     this.seq += 1
     if (change.operation === 'clear') {
-      this.state = { goal: undefined, lastRef: change.cleared, lease: undefined }
+      this.state = { goal: undefined, lastRef: change.cleared, lease: undefined, session: undefined }
     } else {
-      // A state verb never touches the lease: it is a coordinate, and a round
-      // admitted between the lease line and the commit keeps it.
-      this.state = { goal: change.goal, lastRef: { id: change.goal.id, revision: change.goal.revision }, lease: this.state.lease }
+      // A state verb never touches a coordinate: a round admitted between the
+      // lease line and the commit keeps its lease, and a goal keeps its room.
+      this.state = {
+        goal: change.goal,
+        lastRef: { id: change.goal.id, revision: change.goal.revision },
+        lease: this.state.lease,
+        session: this.state.session,
+      }
     }
     this.usageOverlay = undefined
   }
@@ -742,6 +776,47 @@ export class GoalStore {
     if (lease === undefined || lease.holder !== holder) return
     if (lease.expiresAt - Date.now() >= windowMs / 2) return
     this.holdRound(ref, holder, Date.now() + windowMs)
+  }
+
+  /**
+   * Remember the session a goal round ran in, and the model it resolved to.
+   *
+   * The model is remembered because `session.create` accepts one and
+   * `session.update` does not: a session that is later gone can only be replaced
+   * by a *new* session carrying the model, never by patching the old one. Without
+   * it, a goal whose room is closed falls back to the server's default model,
+ * which for at least one account is a model it cannot use at all.
+   *
+   * It is a plain append, and it does not bump the revision: remembering where a
+   * goal worked is not a state verb, and moving the revision would make every
+   * reader-held compare-and-set ref stale for a fact that changed no state.
+   */
+  rememberSession(ref: GoalRef, sessionID: string, model?: { providerID: string; id: string }): void {
+    this.expectCurrent(ref)
+    const at = Date.now()
+    mkdirSync(dirname(this.logPath), { recursive: true })
+    appendFileSync(this.logPath, `${JSON.stringify({
+      kind: 'goal/session',
+      version: GOAL_SESSION_VERSION,
+      id: ref.id,
+      sessionID,
+      ...model === undefined ? {} : { model },
+      at,
+    } satisfies GoalSessionChangeMeta)}\n`)
+    this.seq += 1
+    this.state = { ...this.state, session: { kind: 'goal/session', version: GOAL_SESSION_VERSION, id: ref.id, sessionID, model, at } }
+  }
+
+  /**
+   * The session the goal last worked in, or undefined when it never has.
+   *
+   * Whether that session still exists is deliberately not answered here: the
+   * store folds a durable log and knows nothing about live sessions, so the
+   * caller — which has a client — asks.
+   */
+  get session(): GoalSessionChangeMeta | undefined {
+    this.sync()
+    return this.state.session
   }
 
   /** Build a snapshot carrying the current usage overlay. */

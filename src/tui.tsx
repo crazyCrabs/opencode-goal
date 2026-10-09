@@ -87,7 +87,13 @@ export interface TuiSessionClient {
    * `@opencode/plugin`'s `promise/session.d.ts`), and optional here so a context
    * without it degrades to the old hint rather than throwing.
    */
-  create?(input?: Record<string, never>): Promise<unknown> | unknown
+  create?(input?: { model?: { providerID: string; id: string } }): Promise<unknown> | unknown
+  /**
+   * Read a session, which is how a remembered session is checked for still
+   * existing. Optional because the surface this plugin was written against
+   * declared neither it nor `create`.
+   */
+  get?(input: { sessionID: string }): Promise<unknown> | unknown
 }
 
 /** Minimal TUI plugin context surface (opencode 2.x TUI plugin API). */
@@ -96,7 +102,11 @@ export interface TuiGoalContext {
   client?: { session?: TuiSessionClient }
   data?: {
     on?(event: string, handler: (event: unknown) => void): () => void
-    session?: { status?(sessionID: string): string | undefined }
+    session?: {
+      status?(sessionID: string): string | undefined
+      /** Read a session, which is how the plugin learns the model a room resolves to. */
+      get?(sessionID: string): unknown
+    }
   }
   keymap: TuiKeymapApi
   ui: {
@@ -202,8 +212,34 @@ export function goalSidebarSummary(
   }
 }
 
-/** Sidebar row: durable phase, objective, and budget progress. */
-function GoalSidebarView(props: { goal: GoalView | undefined; onCommand(command: string): void }) {
+/**
+ * The model a session resolves to, read through the plugin's own client.
+ *
+ * `Session.Info` carries an optional `model` (`{providerID, id}`), which is the
+ * only place the plugin can learn it: the continuation prompt carries no model at
+ * all, so a goal that does not read it here runs on whatever the server defaults
+ * to. A client without a session read, or a session with no model set, yields
+ * undefined and the goal remembers only the room — which is still better than
+ * nothing, because a room can be reused even when its model is unknown.
+ */
+function readSessionModel(
+  context: TuiGoalContext,
+  sessionID: string,
+): { providerID: string; id: string } | undefined {
+  const get = context.data?.session?.get
+  if (typeof get !== 'function') return undefined
+  let session: unknown
+  try {
+    session = get(sessionID)
+  } catch {
+    return undefined
+  }
+  const model = (session as { model?: { providerID?: unknown; id?: unknown } } | undefined)?.model
+  if (model === undefined || typeof model.id !== 'string' || typeof model.providerID !== 'string') return undefined
+  return { providerID: model.providerID, id: model.id }
+}
+
+/** Sidebar row: durable phase, objective, and budget progress. */function GoalSidebarView(props: { goal: GoalView | undefined; onCommand(command: string): void }) {
   const summary = goalSidebarSummary(props.goal)
   return (
     <box flexDirection="column" style={{ padding: 1 }}>
@@ -300,19 +336,44 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
          * reported defect was: `/goal` from the home route printed a hint and
          * nothing ran until the human typed a message.
          *
-         * The session is created before the goal is, so the server driver's
-         * `session.created` handler fires while no goal exists and does nothing.
-         * The other order would have both the driver and this plane admit round 1,
-         * and the round lease would have to sort it out.
+         * Reusing the remembered session is what makes the model work. The model is
+         * resolved per session and the continuation prompt carries no model at all,
+         * so a goal in a session it did not remember runs on whatever the server
+         * defaults to — measured, that default can be a model the account cannot use,
+         * which is a 403 the goal then records as `usage-limited`. In a session the
+         * human has been watching, the model is the one they chose.
+         *
+         * A session that is gone is replaced rather than mourned: closing a tab is
+         * the human tidying up, not withdrawing consent, and they have `/goal pause`
+         * and `/goal clear` for the explicit stops. The replacement carries the
+         * remembered model because `session.create` accepts one and `session.update`
+         * does not, so patching the old session was never an option.
          */
-        const ensureSession = async (): Promise<string | undefined> => {
+        const ensureSession = async (store: GoalStore): Promise<string | undefined> => {
           const open = sessionID()
           if (open.length > 0) return open
-          const create = context.client?.session?.create
+          const client = context.client?.session
+          const create = client?.create
           if (typeof create !== 'function') return undefined
+
+          // the room the goal last worked in, and the model it ran on
+          const remembered = store.session
+          if (remembered !== undefined && remembered.sessionID.length > 0 && typeof client?.get === 'function') {
+            try {
+              const existing = await client.get({ sessionID: remembered.sessionID })
+              const id =
+                typeof existing === 'string'
+                  ? existing
+                  : ((existing as { id?: unknown } | undefined)?.id ?? remembered.sessionID)
+              if (typeof id === 'string' && id.length > 0) return id
+            } catch {
+              // the session is gone: fall through and open a new one
+            }
+          }
+
           let made: unknown
           try {
-            made = await create.call(context.client!.session!, {})
+            made = await create.call(client!, remembered?.model === undefined ? {} : { model: remembered.model })
           } catch {
             return undefined // a client that refused is a client that cannot help
           }
@@ -346,7 +407,7 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
          * when it ends is decided once.
          */
         const kickRound = async (store: GoalStore): Promise<void> => {
-          const id = await ensureSession()
+          const id = await ensureSession(store)
           if (id === undefined) {
             // nothing can run the round here: say so instead of going silent
             // after a successful create/edit/resume
@@ -382,6 +443,17 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           // `ensureSession` navigates the router, so the next poll tick sees a
           // session and starts the goal again — round 2 for one `/goal`.
           started.add(`${goal.id}:${id}`)
+          // Remember the room before submitting, so a goal that stops here — a
+          // provider refusal is exactly this case — still knows where it worked and
+          // what model that room resolved to. Remembering after a successful submit
+          // would lose the room precisely when the human most needs it back.
+          const model = readSessionModel(context, id)
+          try {
+            store.rememberSession({ id: goal.id, revision: goal.revision }, id, model)
+          } catch {
+            // a lost race with another writer: the room is a coordinate, not a
+            // state verb, so failing to record it must not fail the round
+          }
           try {
             await context.client?.session?.prompt({
               sessionID: id,

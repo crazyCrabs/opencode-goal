@@ -307,7 +307,35 @@ export interface GoalLeaseChangeMeta {
 export type GoalChangeMeta = GoalSnapshotChangeMeta | GoalUsageChangeMeta | GoalClearChangeMeta
 
 /** Every durable line kind the goal log can hold. */
-export type GoalLogLine = GoalChangeMeta | GoalLeaseChangeMeta
+export type GoalLogLine = GoalChangeMeta | GoalLeaseChangeMeta | GoalSessionChangeMeta
+
+/**
+ * The session a goal works in, and the model that session resolves to.
+ *
+ * A coordinate, not a state verb: the fold gives it its own slot and never counts
+ * it as a round, a block, usage or the revision. It exists because the model is
+ * resolved per session and the continuation prompt carries no model at all —
+ * `PromptInput.Prompt` is `text/files/agents/skills` only — so a goal that does not
+ * remember its session is a goal whose model is whatever the server defaults to.
+ *
+ * Measured: a session created with no model resolves to `claude-haiku-5-5`, an
+ * OpenCode Go model, and fails with 403 for an account without that subscription;
+ * the same session created with a model works. Ticket 28.
+ */
+export interface GoalSessionChangeMeta {
+  readonly kind: 'goal/session'
+  readonly version: 1
+  /** The goal this session belongs to. A line naming another goal is dropped. */
+  readonly id: string
+  readonly sessionID: string
+  /**
+   * The model that session resolves to, when it is known. Remembered so a session
+   * that is later gone can be replaced by one created *with* it —
+   * `session.create` accepts a model and `session.update` does not.
+   */
+  readonly model?: { readonly providerID: string; readonly id: string }
+  readonly at: number
+}
 
 /** Stable error codes for rejected goal reads and mutations. */
 export type GoalErrorCode =
