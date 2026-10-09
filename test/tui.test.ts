@@ -40,6 +40,8 @@ interface Mock {
   lookedUp: string[]
   /** The sessions that still exist, and the model each resolves to. */
   liveSessions: Map<string, { providerID: string; id: string; variant?: string } | undefined>
+  /** Every `switchModel` the plugin asked for. */
+  switched: Array<{ sessionID: string; model: unknown }>
   /** The two session collections. Refill these; replacing them is not possible. */
   collections: {
     sessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
@@ -107,6 +109,8 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
     sessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
     clientSessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
   } = {}
+  /** Every `switchModel` the plugin asked for, so a repair can be proven. */
+  const switched: Array<{ sessionID: string; model: unknown }> = []
   let unsubscribed = false
 
   const context: TuiGoalContext = {
@@ -136,7 +140,18 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
         },
         // The HTTP route behind `client.session.list()`. Measured on a live server:
         // 200, ordered by `time.updated` descending, carrying `model` per session.
-        list: async () => collections.clientSessions ?? [],
+        // The response is `SessionsResponse` — `{data, cursor}` — not an array, and
+        // the first version of this read pushed the envelope as one row and so
+        // found no model at all.
+        list: async () => ({ data: collections.clientSessions ?? [], cursor: {} }),
+        // `session.update` does not accept a model; this does.
+        switchModel: async (input: { sessionID: string; model: unknown }) => {
+          switched.push(input)
+          const row = collections.sessions?.find(r => r.id === input.sessionID)
+          if (row !== undefined) row.model = input.model as never
+          const live = liveSessions.get(input.sessionID)
+          if (live !== undefined) liveSessions.set(input.sessionID, input.model as never)
+        },
       },
     },
     data: {
@@ -188,7 +203,7 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
     },
   }
 
-  return { context, toasts, prompts, created, navigated, madeWith, lookedUp, liveSessions, collections, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
+  return { context, toasts, prompts, created, navigated, madeWith, lookedUp, liveSessions, collections, switched, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
 }
 
 /** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
@@ -217,6 +232,7 @@ function setup(route?: TuiRouteRef): Mock {
     lookedUp: harness.lookedUp,
     liveSessions: harness.liveSessions,
     collections: harness.collections,
+    switched: harness.switched,
     sessions: undefined,
     clientSessions: undefined,
     slots: harness.slots,
@@ -530,6 +546,7 @@ function polling(route: TuiRouteRef, options: { canCreate?: boolean } = {}): Moc
     lookedUp: harness.lookedUp,
     liveSessions: harness.liveSessions,
     collections: harness.collections,
+    switched: harness.switched,
     sessions: undefined,
     clientSessions: undefined,
     slots: harness.slots,
@@ -957,6 +974,117 @@ describe('the goal follows the model opencode is already using', () => {
       await harness.command('goal.command').run!('nothing to read')
       await ticks()
       expect(harness.madeWith[0]).toBeUndefined()
+    } finally {
+      // handled by cleanups
+    }
+  })
+})
+
+describe('the {data} envelope, and repairing a room that has no model', () => {
+  test('the client list envelope is unwrapped, not treated as one row', async () => {
+    // The first version of this read pushed `{data, cursor}` as a single row, so
+    // every session looked model-less and the goal remembered nothing — which is
+    // exactly what the human saw: `SESSION ... model=None` in their own goal log.
+    const harness = polling({ type: 'home' })
+    try {
+      harness.collections.sessions = undefined
+      harness.collections.clientSessions = [
+        { id: 'ses-a', model: undefined, time: { updated: 1 }, location: { directory: harness.directory } },
+        { id: 'ses-b', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 2 }, location: { directory: harness.directory } },
+      ]
+      await harness.command('goal.command').run!('envelope')
+      await ticks()
+      expect(harness.madeWith[0]).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a remembered room with no model is repaired, not replaced', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      // A goal created before this fix remembers a room that carries no model, so
+      // reusing it would reproduce the 403 exactly. `session.update` does not
+      // accept a model; `switchModel` does.
+      harness.collections.sessions = [
+        { id: 'ses-remembered', model: undefined, time: { updated: 5 }, location: { directory: harness.directory } },
+      ]
+      harness.liveSessions.set('ses-remembered', undefined)
+      harness.collections.clientSessions = [
+        { id: 'ses-chosen', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 9 }, location: { directory: harness.directory } },
+      ]
+
+      // first run: creates a room and remembers it with the model it read
+      await harness.command('goal.command').run!('will be remembered')
+      await ticks()
+      const room = harness.created[0]
+      expect(room).toBeDefined()
+
+      // The human navigates away; the room survives but carries no model, because
+      // every session the plugin created before this read existed has none. Not
+      // being in `liveSessions` at all would mean the room is gone, which is the
+      // other test's case and correctly makes a new room.
+      harness.liveSessions.set(room, undefined)
+      harness.collections.sessions = [{ id: room, model: undefined, time: { updated: 10 }, location: { directory: harness.directory } }]
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({ type: 'home' })
+      await harness.command('goal.command').run!('resume')
+      await ticks()
+
+      expect(harness.lookedUp).toContain(room)
+      expect(harness.created.length).toBe(1) // the same room
+      const repair = harness.switched.find(s => s.sessionID === room)
+      expect(repair?.model).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a directory spelled with backslashes still matches the project', async () => {
+    // The session rows carry a location with backslashes while the plugin's own
+    // `context.location.directory` uses forward slashes. Comparing them raw drops
+    // every row, which is the other way this read can answer nothing.
+    const harness = polling({ type: 'home' })
+    try {
+      const backslashed = harness.directory.split('/').join(String.fromCharCode(92))
+      harness.collections.sessions = [
+        { id: 'ses-bs', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 1 }, location: { directory: backslashed } },
+        { id: 'ses-other', model: { providerID: 'nope', id: 'nope' }, time: { updated: 99 }, location: { directory: 'C:/somewhere/else' } },
+      ]
+      await harness.command('goal.command').run!('separator shapes')
+      await ticks()
+      expect(harness.madeWith[0]).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a model from another project is used only when this project has none', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      // Nothing in this project carries a model. The literal reading of "the model
+      // opencode is using" is still better than falling back to the server default,
+      // which is a 403.
+      harness.collections.sessions = [
+        { id: 'ses-far', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 1 }, location: { directory: 'C:/elsewhere' } },
+      ]
+      await harness.command('goal.command').run!('only other projects')
+      await ticks()
+      expect(harness.madeWith[0]).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a remembered room that already has the model is left alone', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-remembered' })
+    try {
+      harness.liveSessions.set('ses-remembered', { providerID: 'stepfun', id: 'step-5-preview' })
+      harness.collections.sessions = [
+        { id: 'ses-remembered', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 5 }, location: { directory: harness.directory } },
+      ]
+      await harness.command('goal.command').run!('already right')
+      await ticks()
+      expect(harness.switched.length).toBe(0)
     } finally {
       // handled by cleanups
     }
