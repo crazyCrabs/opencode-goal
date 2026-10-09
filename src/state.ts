@@ -93,7 +93,13 @@ function sameLease(a: GoalLeaseChangeMeta | undefined, b: GoalLeaseChangeMeta | 
 /** Whether two folded session coordinates are the same session and model. */
 function sameSession(a: GoalSessionChangeMeta | undefined, b: GoalSessionChangeMeta | undefined): boolean {
   if (a === undefined || b === undefined) return a === b
-  return a.id === b.id && a.sessionID === b.sessionID && a.model?.id === b.model?.id && a.model?.providerID === b.model?.providerID
+  return (
+    a.id === b.id &&
+    a.sessionID === b.sessionID &&
+    a.model?.id === b.model?.id &&
+    a.model?.providerID === b.model?.providerID &&
+    a.model?.variant === b.model?.variant
+  )
 }
 
 /** Whether a fold holds nothing any reader of this store depends on. */
@@ -791,7 +797,7 @@ export class GoalStore {
    * goal worked is not a state verb, and moving the revision would make every
    * reader-held compare-and-set ref stale for a fact that changed no state.
    */
-  rememberSession(ref: GoalRef, sessionID: string, model?: { providerID: string; id: string }): void {
+  rememberSession(ref: GoalRef, sessionID: string, model?: { providerID: string; id: string; variant?: string }): void {
     this.expectCurrent(ref)
     const at = Date.now()
     mkdirSync(dirname(this.logPath), { recursive: true })

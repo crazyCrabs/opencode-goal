@@ -39,7 +39,16 @@ interface Mock {
   /** Every session id a `get` was asked about. */
   lookedUp: string[]
   /** The sessions that still exist, and the model each resolves to. */
-  liveSessions: Map<string, { providerID: string; id: string } | undefined>
+  liveSessions: Map<string, { providerID: string; id: string; variant?: string } | undefined>
+  /** The two session collections. Refill these; replacing them is not possible. */
+  collections: {
+    sessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
+    clientSessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
+  }
+  /** @deprecated set `collections.sessions`; kept so old tests fail loudly. */
+  sessions?: never
+  /** @deprecated set `collections.clientSessions`; kept so old tests fail loudly. */
+  clientSessions?: never
   slots: SlotClaim[]
   confirms: Array<{ title: string; message: string }>
   objectivePrompts: Array<{ title: string }>
@@ -87,6 +96,17 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
   const objectivePrompts: Mock['objectivePrompts'] = []
   const layers: TuiKeymapLayerInput[] = []
   const state = { confirmResult: true, promptResult: 'objective from the dialog' as string | undefined, status: 'idle' }
+  /**
+   * The two session collections, in a box a test can refill after the context is
+   * built. A plain `const` destructured at build time would go stale the moment a
+   * test replaced the reference, which is exactly the bug this replaces: the mock
+   * read an undeclared free variable, the plugin's own try/catch swallowed the
+   * ReferenceError, and a test bug looked like a plugin gap.
+   */
+  const collections: {
+    sessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
+    clientSessions?: Array<{ id: string; model?: { providerID: string; id: string; variant?: string }; time?: { updated?: number }; location?: { directory?: string } }> | undefined
+  } = {}
   let unsubscribed = false
 
   const context: TuiGoalContext = {
@@ -114,13 +134,22 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
           if (!liveSessions.has(input.sessionID)) throw new Error('session not found')
           return { id: input.sessionID, model: liveSessions.get(input.sessionID) }
         },
+        // The HTTP route behind `client.session.list()`. Measured on a live server:
+        // 200, ordered by `time.updated` descending, carrying `model` per session.
+        list: async () => collections.clientSessions ?? [],
       },
     },
     data: {
       on: () => () => {
         unsubscribed = true
       },
-      session: { status: () => state.status, get: (id: string) => ({ id, model: liveSessions.get(id) }) },
+      session: {
+        status: () => state.status,
+        get: (id: string) => ({ id, model: liveSessions.get(id) }),
+        // The TUI's own collection. Undefined when a test wants to prove the
+        // client route is the fallback.
+        list: () => collections.sessions ?? [],
+      },
     },
     keymap: {
       // the real TUI owns the layer for the calling component's lifetime
@@ -159,7 +188,7 @@ function makeContext(directory: string, initialRoute: TuiRouteRef = { type: 'ses
     },
   }
 
-  return { context, toasts, prompts, created, navigated, madeWith, lookedUp, liveSessions, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
+  return { context, toasts, prompts, created, navigated, madeWith, lookedUp, liveSessions, collections, slots, confirms, objectivePrompts, layers, state, unsubscribed: () => unsubscribed }
 }
 
 /** Build the plugin against a mock of the real TUI context (opencode 2.x API). */
@@ -187,6 +216,9 @@ function setup(route?: TuiRouteRef): Mock {
     madeWith: harness.madeWith,
     lookedUp: harness.lookedUp,
     liveSessions: harness.liveSessions,
+    collections: harness.collections,
+    sessions: undefined,
+    clientSessions: undefined,
     slots: harness.slots,
     confirms: harness.confirms,
     objectivePrompts: harness.objectivePrompts,
@@ -497,6 +529,9 @@ function polling(route: TuiRouteRef, options: { canCreate?: boolean } = {}): Moc
     madeWith: harness.madeWith,
     lookedUp: harness.lookedUp,
     liveSessions: harness.liveSessions,
+    collections: harness.collections,
+    sessions: undefined,
+    clientSessions: undefined,
     slots: harness.slots,
     confirms: harness.confirms,
     objectivePrompts: harness.objectivePrompts,
@@ -835,5 +870,95 @@ describe('the goal remembers its room, and the model that room ran on', () => {
     // and it is not a state verb: no `operation`, and it did not become a round
     expect(sessions[0].operation).toBeUndefined()
     expect(lines.filter(line => line['operation'] === 'continue').length).toBe(1)
+  })
+})
+
+describe('the goal follows the model opencode is already using', () => {
+  test('with no session open, the newest session carrying a model supplies it', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      // The human's choice lives in a session they worked in earlier. There is no
+      // session open, which is exactly the home-route case that used to create a
+      // model-less session and get a Go model back.
+      harness.liveSessions.set('ses-old', { providerID: 'stepfun', id: 'step-5-preview' })
+      harness.collections.sessions = [
+        { id: 'ses-old', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 100 }, location: { directory: harness.directory } },
+        { id: 'ses-nomodel', model: undefined, time: { updated: 200 }, location: { directory: harness.directory } },
+        // an older session with a different model, which must lose
+        { id: 'ses-older', model: { providerID: 'opencode', id: 'big-pickle' }, time: { updated: 50 }, location: { directory: harness.directory } },
+        // another project's choice, which must be ignored
+        { id: 'ses-elsewhere', model: { providerID: 'nope', id: 'nope' }, time: { updated: 999 }, location: { directory: 'C:/elsewhere' } },
+      ]
+
+      await harness.command('goal.command').run!('use the model I chose')
+      await ticks()
+
+      expect(harness.madeWith[0]).toEqual({ providerID: 'stepfun', id: 'step-5-preview' })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('the session open on the router wins over the newest one', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-open' })
+    try {
+      harness.liveSessions.set('ses-open', { providerID: 'opencode', id: 'big-pickle', variant: 'max' })
+      harness.collections.sessions = [
+        { id: 'ses-newer', model: { providerID: 'stepfun', id: 'step-5-preview' }, time: { updated: 5000 }, location: { directory: harness.directory } },
+      ]
+
+      await harness.command('goal.command').run!('I am looking at this one')
+      await ticks()
+
+      // the human is standing in ses-open, so that is what opencode is using
+      expect(harness.prompts[0].sessionID).toBe('ses-open')
+      expect(new GoalStore(harness.directory).session?.model).toEqual({
+        providerID: 'opencode',
+        id: 'big-pickle',
+        variant: 'max',
+      })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a variant survives the round trip, because it changes which model runs', async () => {
+    const mock = setup()
+    mock.liveSessions.set('ses-goal', { providerID: 'opencode', id: 'deepseek-v4-flash', variant: 'max' })
+    await mock.command('goal.command').run!('variant matters')
+
+    const remembered = new GoalStore(mock.directory).session?.model
+    expect(remembered).toEqual({ providerID: 'opencode', id: 'deepseek-v4-flash', variant: 'max' })
+  })
+
+  test('the client list is the fallback when the TUI collection is absent', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      // no `data.session.list` at all, and no open session: only the HTTP route
+      // can answer, which is the layer measured returning models per session
+      harness.collections.sessions = undefined
+      harness.collections.clientSessions = [
+        { id: 'ses-via-client', model: { providerID: 'baishan', id: 'DeepSeek-V4-Pro' }, time: { updated: 10 }, location: { directory: harness.directory } },
+      ]
+
+      await harness.command('goal.command').run!('client only')
+      await ticks()
+
+      expect(harness.madeWith[0]).toEqual({ providerID: 'baishan', id: 'DeepSeek-V4-Pro' })
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('no model anywhere still runs, and fails honestly', async () => {
+    const harness = polling({ type: 'home' })
+    try {
+      harness.collections.sessions = undefined
+      await harness.command('goal.command').run!('nothing to read')
+      await ticks()
+      expect(harness.madeWith[0]).toBeUndefined()
+    } finally {
+      // handled by cleanups
+    }
   })
 })

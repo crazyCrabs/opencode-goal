@@ -332,8 +332,11 @@ export interface GoalSessionChangeMeta {
    * The model that session resolves to, when it is known. Remembered so a session
    * that is later gone can be replaced by one created *with* it —
    * `session.create` accepts a model and `session.update` does not.
+   *
+   * `variant` is kept because it is part of `ModelRef` and it changes which model
+   * actually runs: the same id resolves differently at `variant: "max"`.
    */
-  readonly model?: { readonly providerID: string; readonly id: string }
+  readonly model?: { readonly providerID: string; readonly id: string; readonly variant?: string }
   readonly at: number
 }
 

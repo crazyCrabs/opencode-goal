@@ -87,7 +87,14 @@ export interface TuiSessionClient {
    * `@opencode/plugin`'s `promise/session.d.ts`), and optional here so a context
    * without it degrades to the old hint rather than throwing.
    */
-  create?(input?: { model?: { providerID: string; id: string } }): Promise<unknown> | unknown
+  create?(input?: { model?: GoalModelRef }): Promise<unknown> | unknown
+  /**
+   * Every session, newest first. Declared on the generated client, and the
+   * route behind it was measured returning `model` and `time.updated` per
+   * session — which is how a goal with no session of its own learns what model
+   * opencode is using.
+   */
+  list?(input?: Record<string, unknown>): Promise<unknown> | unknown
   /**
    * Read a session, which is how a remembered session is checked for still
    * existing. Optional because the surface this plugin was written against
@@ -106,6 +113,8 @@ export interface TuiGoalContext {
       status?(sessionID: string): string | undefined
       /** Read a session, which is how the plugin learns the model a room resolves to. */
       get?(sessionID: string): unknown
+      /** Every session, newest first. Declared by the shipped TUI context. */
+      list?(): unknown
     }
   }
   keymap: TuiKeymapApi
@@ -225,7 +234,7 @@ export function goalSidebarSummary(
 function readSessionModel(
   context: TuiGoalContext,
   sessionID: string,
-): { providerID: string; id: string } | undefined {
+): GoalModelRef | undefined {
   const get = context.data?.session?.get
   if (typeof get !== 'function') return undefined
   let session: unknown
@@ -234,9 +243,100 @@ function readSessionModel(
   } catch {
     return undefined
   }
-  const model = (session as { model?: { providerID?: unknown; id?: unknown } } | undefined)?.model
+  const model = (session as { model?: { providerID?: unknown; id?: unknown; variant?: unknown } } | undefined)?.model
   if (model === undefined || typeof model.id !== 'string' || typeof model.providerID !== 'string') return undefined
-  return { providerID: model.providerID, id: model.id }
+  if (model.providerID.length === 0 || model.id.length === 0) return undefined
+  return typeof model.variant === 'string' && model.variant.length > 0
+    ? { providerID: model.providerID, id: model.id, variant: model.variant }
+    : { providerID: model.providerID, id: model.id }
+}
+
+/** A model reference, in the shape `session.create` accepts. */
+type GoalModelRef = { providerID: string; id: string; variant?: string }
+
+/**
+ * The model opencode is actually using, read through the plugin's own surfaces.
+ *
+ * This is the whole answer to "why does the goal run a different model from the
+ * one I chose". The model is resolved **per session** and the continuation prompt
+ * carries no model at all — measured, `PromptInput.Prompt` is
+ * `text/files/agents/skills` only — so a goal in a session it did not create runs
+ * on whatever the server defaults to, and that default is a model at least one
+ * account cannot use.
+ *
+ * Three layers, because the plugin surface declares two different ways to ask and
+ * neither is guaranteed:
+ *
+ * 1. the session open on the router — the most immediate expression of the human's
+ *    choice, since they are looking at it;
+ * 2. `data.session.list()` — the TUI's own session collection, newest first;
+ * 3. `context.client.session.list()` — the same fact over HTTP, which is the route
+ *    the server actually serves and which was measured returning `model` and
+ *    `time.updated` per session.
+ *
+ * Anything that answers, answers. A surface that is missing or throws is skipped
+ * rather than guessed at, because a wrong model is a 403 and no model at all is a
+ * 403 the human can read.
+ */
+async function readCurrentModel(
+  context: TuiGoalContext,
+  openSessionID: string,
+): Promise<GoalModelRef | undefined> {
+  const normalise = (value: unknown): GoalModelRef | undefined => {
+    const model = value as { providerID?: unknown; id?: unknown; variant?: unknown } | undefined | null
+    if (model === undefined || model === null) return undefined
+    if (typeof model.providerID !== 'string' || typeof model.id !== 'string') return undefined
+    if (model.providerID.length === 0 || model.id.length === 0) return undefined
+    return typeof model.variant === 'string' && model.variant.length > 0
+      ? { providerID: model.providerID, id: model.id, variant: model.variant }
+      : { providerID: model.providerID, id: model.id }
+  }
+
+  // 1. the room the human is standing in
+  if (openSessionID.length > 0) {
+    try {
+      const open = context.data?.session?.get?.(openSessionID)
+      const model = normalise((open as { model?: unknown } | undefined)?.model)
+      if (model !== undefined) return model
+    } catch {
+      // fall through to the collection
+    }
+  }
+
+  // 2. and 3: every session, newest first. The newest one carrying a model is the
+  // best available answer to "what is opencode using right now", and it is what
+  // the human asked for: the goal follows the choice already made, rather than
+  // overriding it with a guess.
+  const directory = context.location?.directory
+  const rows: unknown[] = []
+  try {
+    const local = context.data?.session?.list?.()
+    if (Array.isArray(local)) rows.push(...local)
+  } catch {
+    // the TUI collection is absent in some hosts
+  }
+  if (rows.length === 0) {
+    try {
+      const listed = await context.client?.session?.list?.()
+      if (Array.isArray(listed)) rows.push(...listed)
+      else if (listed !== undefined && listed !== null) rows.push(listed)
+    } catch {
+      // no enumeration available
+    }
+  }
+
+  let newest: { at: number; model: GoalModelRef } | undefined
+  for (const row of rows) {
+    const model = normalise((row as { model?: unknown } | undefined)?.model)
+    if (model === undefined) continue
+    // a session from another project says nothing about this one's choice
+    const location = (row as { location?: { directory?: unknown } } | undefined)?.location
+    if (directory !== undefined && typeof location?.directory === 'string' && location.directory !== directory) continue
+    const at = (row as { time?: { updated?: unknown } } | undefined)?.time?.updated
+    const stamp = typeof at === 'number' ? at : 0
+    if (newest === undefined || stamp > newest.at) newest = { at: stamp, model }
+  }
+  return newest?.model
 }
 
 /** Sidebar row: durable phase, objective, and budget progress. */function GoalSidebarView(props: { goal: GoalView | undefined; onCommand(command: string): void }) {
@@ -371,9 +471,15 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
             }
           }
 
+          // The model to run on, in order of how directly it expresses the human's
+          // choice: what opencode is using right now, then what this goal last ran
+          // on. The second is the recovery case — the room is gone and the new one
+          // must inherit its model rather than fall back to the server default.
+          const model = (await readCurrentModel(context, open)) ?? remembered?.model
+
           let made: unknown
           try {
-            made = await create.call(client!, remembered?.model === undefined ? {} : { model: remembered.model })
+            made = await create.call(client!, model === undefined ? {} : { model })
           } catch {
             return undefined // a client that refused is a client that cannot help
           }
