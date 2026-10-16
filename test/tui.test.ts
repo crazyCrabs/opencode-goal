@@ -1090,3 +1090,110 @@ describe('the {data} envelope, and repairing a room that has no model', () => {
     }
   })
 })
+
+describe('the auto-start does not follow the human into another session', () => {
+  /**
+   * The human's report, and why the server-side fix did not close it:
+   *
+   *   当其他 session 里面的任务完成时，goal 的任务触发了。
+   *
+   * `autoStart` read the session open on the router and kicked a round there, with
+   * no question about whether that session was the goal's room. It is driven by
+   * the sidebar poll and by `session.execution.succeeded`, so any turn completing
+   * anywhere re-ran it — which is the reported symptom arriving through the TUI
+   * plane rather than the server driver.
+   */
+  test('navigating to another session does not start a round there', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-room' })
+    try {
+      // the goal runs in the session the human is in
+      await harness.command('goal.command').run!('objective in my room')
+      await ticks()
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts[0].sessionID).toBe('ses-room')
+      expect(new GoalStore(harness.directory).session?.sessionID).toBe('ses-room')
+
+      // the human navigates to a different session of the same project
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-elsewhere',
+      })
+      await ticks()
+
+      // the goal stays in its own room
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts.some(prompt => prompt.sessionID === 'ses-elsewhere')).toBe(false)
+      expect(new GoalStore(harness.directory).view()!.roundsStarted).toBe(1)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('the goal still starts in its own room with no human input', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-room' })
+    try {
+      await harness.command('goal.command').run!('self-sustaining')
+      await ticks()
+      expect(harness.prompts.length).toBe(1)
+
+      // the poll keeps ticking in the same session: nothing new is admitted,
+      // because the round is already running there
+      await ticks()
+      expect(harness.prompts.length).toBe(1)
+      expect(new GoalStore(harness.directory).view()!.roundsStarted).toBe(1)
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('a goal with no room of its own still starts in the session that is open', async () => {
+    // The case the fix must not break: a goal written by another writer, which
+    // this plugin's store is born beside and which has no remembered room. That is
+    // ticket 26's case, and opening a session is the human's go-ahead.
+    const harness = polling({ type: 'home' })
+    try {
+      new GoalStore(harness.directory).create('auto objective', 25, 0)
+      await ticks()
+      expect(harness.prompts.length).toBe(0)
+
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-auto',
+      })
+      await ticks()
+
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts[0].sessionID).toBe('ses-auto')
+      expect(harness.prompts[0].text).toContain('round 1/25')
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('coming back to the goal room resumes driving it', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-room' })
+    try {
+      await harness.command('goal.command').run!('will be left and returned to')
+      await ticks()
+      expect(harness.prompts.length).toBe(1)
+
+      // the human wanders off and comes back
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-elsewhere',
+      })
+      await ticks()
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-room',
+      })
+      await ticks()
+
+      // still exactly one round, in the goal's own room: the wander cost nothing
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts[0].sessionID).toBe('ses-room')
+    } finally {
+      // handled by cleanups
+    }
+  })
+})

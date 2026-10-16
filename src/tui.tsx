@@ -799,6 +799,21 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           const goal = store.view()
           if (goal === undefined || goal.phase !== 'active') return
           if (started.has(`${goal.id}:${id}`)) return
+          // A goal works in one room, and this poll must not follow the human out
+          // of it.
+          //
+          // It used to kick a round into whatever session was open on the router,
+          // and it is driven both by the sidebar poll and by
+          // `session.execution.succeeded` — so a turn completing in any session
+          // re-ran it and the goal's round landed in the human's other session.
+          // That is the human's report, arriving through the TUI plane rather than
+          // the server driver: "当其他 session 里面的任务完成时，goal 的任务触发了".
+          //
+          // A goal with no room of its own adopts the open session, which is
+          // ticket 26's case — a goal written by another writer, whose room this
+          // process never saw, started by the human opening a session.
+          const room = store.session
+          if (room !== undefined && room.sessionID !== id) return
           // Arm before kicking, for the same reason the server driver arms on
           // session adoption: this store is a fresh fold of the durable log, so a
           // goal it did not create itself reads as disarmed, and admission would
