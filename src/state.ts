@@ -833,17 +833,24 @@ export class GoalStore {
   rememberSession(ref: GoalRef, sessionID: string, model?: { providerID: string; id: string; variant?: string }): void {
     this.expectCurrent(ref)
     const at = Date.now()
+    // A caller that knows only the room must not erase a model another caller
+    // learned: the driver remembers rooms, the command plane remembers models, and
+    // the two write the same line. Losing the model here would send the next
+    // recovery back to the server default, which is the 403 this coordinate
+    // exists to prevent.
+    const known = this.state.session?.sessionID === sessionID ? this.state.session.model : undefined
+    const merged = model ?? known
     mkdirSync(dirname(this.logPath), { recursive: true })
     appendFileSync(this.logPath, `${JSON.stringify({
       kind: 'goal/session',
       version: GOAL_SESSION_VERSION,
       id: ref.id,
       sessionID,
-      ...model === undefined ? {} : { model },
+      ...merged === undefined ? {} : { model: merged },
       at,
     } satisfies GoalSessionChangeMeta)}\n`)
     this.seq += 1
-    this.state = { ...this.state, session: { kind: 'goal/session', version: GOAL_SESSION_VERSION, id: ref.id, sessionID, model, at } }
+    this.state = { ...this.state, session: { kind: 'goal/session', version: GOAL_SESSION_VERSION, id: ref.id, sessionID, model: merged, at } }
   }
 
   /**

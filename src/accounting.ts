@@ -219,9 +219,18 @@ export class GoalAccounting {
     store.noteToolCall()
   }
 
-  onTurnEnded(directory: string, sessionID: string, failed = false): void {
+  onTurnEnded(directory: string, sessionID: string, failed = false, belongsToGoal = true): void {
     const store = this.hooks.storeFor(directory)
     if (store.view() === undefined) {
+      this.toolCallThisTurn.delete(sessionID)
+      return
+    }
+    // A turn in a session the goal is not working in is not the goal's turn at
+    // all, so it is charged to nothing: not the stall counter, not the budget,
+    // not the no-progress fingerprint. A human talking in a second session of the
+    // same project was incrementing the stall counter, and two such turns blocked
+    // the goal as `no-tool-call` — measured, in the human's own scenario.
+    if (!belongsToGoal) {
       this.toolCallThisTurn.delete(sessionID)
       return
     }

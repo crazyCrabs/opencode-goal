@@ -334,11 +334,11 @@ describe('the trigger layer attributes a location-less turn without a lookup', (
       expect(server.lookups.length).toBe(0)
 
       // the step-started event carries the directory
-      await server.stepStarted('ses-trigger')
+      await server.stepStarted('ses-integration')
       expect(server.lookups.length).toBe(0)
 
       // so the location-less completion event is attributed from the map
-      await server.turnFinished('ses-trigger')
+      await server.turnFinished('ses-integration')
       expect(server.prompts.length).toBe(1)
       expect(server.prompts[0].text).toContain('round 2/25')
       // and no session lookup was made at any point
@@ -359,8 +359,8 @@ describe('the trigger layer attributes a location-less turn without a lookup', (
       await tui.command.run('lookup objective')
 
       // no step-started, no created: the map has nothing for this session
-      await server.turnFinished('ses-unknown')
-      expect(server.lookups).toEqual(['ses-unknown'])
+      await server.turnFinished('ses-integration')
+      expect(server.lookups).toEqual(['ses-integration'])
       expect(server.prompts.length).toBe(1)
       expect(server.prompts[0].text).toContain('round 2/25')
 
@@ -501,7 +501,7 @@ describe('the external wait is durable and woken by a human', () => {
       const server = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
-      await server.stepStarted('ses-wake')
+      await server.stepStarted('ses-integration')
       const store = new GoalStore(directory)
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
 
@@ -512,7 +512,7 @@ describe('the external wait is durable and woken by a human', () => {
       expect(server.prompts.length).toBe(0)
 
       // a human sends a message: the wait ends, durably
-      await server.inboxArrived('ses-wake', 'the review is done, carry on')
+      await server.inboxArrived('ses-integration', 'the review is done, carry on')
       const after = new GoalStore(directory).view()!
       expect(after.waitUntil).toBe(0)
       expect(after.waitReason).toBeUndefined()
@@ -520,7 +520,7 @@ describe('the external wait is durable and woken by a human', () => {
       // and the goal is armed, so when this human's own turn finishes the next
       // round is admitted rather than reported disarmed
       expect(after.phase).toBe('active')
-      await server.turnFinished('ses-wake')
+      await server.turnFinished('ses-integration')
       expect(server.prompts.length).toBe(1)
       expect(server.prompts[0].text).toContain('round 2/25')
 
@@ -537,21 +537,21 @@ describe('the external wait is durable and woken by a human', () => {
       const server = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
-      await server.stepStarted('ses-bare')
+      await server.stepStarted('ses-integration')
       const store = new GoalStore(directory)
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
 
       // The live v2 server reports this event with no location. Before ticket 25
       // this branch read the location directly and was the only one that did, so
       // the wake source was silent on the server the plugin has to run on.
-      await server.inboxArrivedBare('ses-bare', 'the review is done, carry on')
+      await server.inboxArrivedBare('ses-integration', 'the review is done, carry on')
       const after = new GoalStore(directory).view()!
       expect(after.waitUntil).toBe(0)
       expect(after.waitReason).toBeUndefined()
       expect(after.phase).toBe('active')
 
       // and the arriving turn drives the next round, armed rather than disarmed
-      await server.turnFinished('ses-bare')
+      await server.turnFinished('ses-integration')
       expect(server.prompts.length).toBe(1)
       expect(server.prompts[0].text).toContain('round 2/25')
 
@@ -635,10 +635,10 @@ describe('a provider refusal stops the goal durably', () => {
       const server = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('refused objective')
-      await server.stepStarted('ses-refused')
+      await server.stepStarted('ses-integration')
 
       // the turn fails with the provider's structured refusal
-      await server.turnFinished('ses-refused', 'failed', undefined, REFUSAL)
+      await server.turnFinished('ses-integration', 'failed', undefined, REFUSAL)
 
       // the goal is durably blocked, and the reason says the provider
       const store = new GoalStore(directory)
@@ -663,11 +663,11 @@ describe('a provider refusal stops the goal durably', () => {
       const server = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('transient objective')
-      await server.stepStarted('ses-transient')
+      await server.stepStarted('ses-integration')
 
       // a 500 is retryable; stopping the goal would lose the next attempt's work
       await server.toolCalled('ses-transient', 'call-transient')
-      await server.turnFinished('ses-transient', 'failed', undefined, {
+      await server.turnFinished('ses-integration', 'failed', undefined, {
         type: 'server',
         message: 'internal error',
         status: 500,
@@ -677,7 +677,7 @@ describe('a provider refusal stops the goal durably', () => {
       expect(store.view()!.phase).toBe('active')
       // and the loop keeps going on the next completion
       await server.toolCalled('ses-transient', 'call-transient-2')
-      await server.turnFinished('ses-transient')
+      await server.turnFinished('ses-integration')
       expect(server.prompts.length).toBe(2)
       expect(server.prompts[1].text).toContain('round 3/25')
 
@@ -694,8 +694,8 @@ describe('a provider refusal stops the goal durably', () => {
       const first = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('restart objective')
-      await first.stepStarted('ses-restart')
-      await first.turnFinished('ses-restart', 'failed', undefined, REFUSAL)
+      await first.stepStarted('ses-integration')
+      await first.turnFinished('ses-integration', 'failed', undefined, REFUSAL)
       tui.cleanup()
       await first.cleanup()
 

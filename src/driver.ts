@@ -150,6 +150,11 @@ export class GoalDriver {
     const store = this.storeFor(directory)
     const goal = store.view()
     if (goal === undefined || goal.phase !== 'active') return
+    // The goal has a room of its own from here on, whichever way this call ends.
+    // Pinning it before anything can drive means a session opened later cannot be
+    // mistaken for the goal's — the reported defect, arriving through the door of
+    // a second session in the same project.
+    this.rememberRoom(store, sessionID)
     // an external wait stays suppressed: goal_wait means quiet until the
     // deadline or the next human turn, not until the next session opens
     if (store.waitUntil > Date.now()) return
@@ -309,6 +314,9 @@ export class GoalDriver {
 
   /** Finish one turn reported through the execution events. */
   private async finish(sessionID: string, directory: string, reason?: string, error?: unknown): Promise<void> {
+    // Asked before the round is released, because releasing it is what makes
+    // `isGoalTurn` forget this session ever had one.
+    const mine = this.ownsTurn(sessionID, directory)
     const store = this.storeFor(directory)
     // the turn that was in flight is over: release the round before admitting
     // the next one, whether or not this session's turn is admitted again
@@ -320,6 +328,12 @@ export class GoalDriver {
     if (goal !== undefined) {
       store.releaseRound({ id: goal.id, revision: goal.revision }, this.holder)
     }
+    // A turn in a session the goal is not working in is none of the goal's
+    // business: nothing to continue, nothing to charge, nothing to stop. This is
+    // the human's report — they talked in another session of the same project and
+    // the goal both advanced a round into that session and was blocked by its
+    // tool-less turns.
+    if (!mine) return
     if (reason === 'user') {
       this.hooks.log('goal round interrupted by the user; waiting for a human turn', { sessionID })
       return
@@ -422,6 +436,9 @@ export class GoalDriver {
     // session opening defers instead of racing the same goal
     this.roundsInFlight.add(sessionID)
     this.running.set(directory, sessionID)
+    // and the room is pinned durably, so the turn-completion handler can tell
+    // this session from the human's other ones
+    this.rememberRoom(store, sessionID)
 
     // the round is admitted: submitting it must not stall the driver, because
     // the turn's completion event (not this call) accounts it and admits the
@@ -467,6 +484,69 @@ export class GoalDriver {
    */
   isGoalTurn(sessionID: string): boolean {
     return this.roundsInFlight.has(sessionID)
+  }
+
+  /**
+   * Whether a turn completing in this session is the goal's to continue.
+   *
+   * This is the question the turn-completion handler used to not ask. It passed
+   * whatever session the event named to both the accounting and the driver, so a
+   * human talking in a second session of the same project advanced the goal —
+   * measured, a round was admitted and its prompt submitted into the human's
+   * session — and the human's tool-less turns then blocked the goal as
+   * `no-tool-call`. Two symptoms, one missing question.
+   *
+   * Three clauses, because the plugin can only know where the goal *acted*, never
+   * which session the human is "in":
+   *
+   * 1. a round this process submitted is running here — definitive;
+   * 2. the goal last acted here — strong, and the clause that closes the reported
+   *    bug once the driver remembers its room;
+   * 3. the goal has never acted in any room — the `opencode run --standalone` and
+   *    restart case, where the goal predates the process and so does its session,
+   *    and the first turn it sees is the one it adopts.
+   *
+   * Clause 3 is the residual hole and is recorded as such: a goal that has never
+   * acted, whose human then works in a different session, is still adopted.
+   * Closing it needs a signal the plugin does not have — which session the human
+   * is standing in.
+   */
+  /**
+   * Whether a turn completing in this session is the goal's to continue.
+   *
+   * Public because the adapter asks it before either half handles the turn: the
+   * accounting needs to know what to charge and the driver needs to know whether
+   * to continue, and the two must not answer differently — a guard answered in
+   * two places can disagree with itself.
+   */
+  ownsTurn(sessionID: string, directory: string): boolean {
+    if (this.roundsInFlight.has(sessionID)) return true
+    const store = this.storeFor(directory)
+    const room = store.session
+    if (room !== undefined) return room.sessionID === sessionID
+    return true
+  }
+
+  /**
+   * Remember the room the goal works in, once it has one.
+   *
+   * Called at every admission and at the first session created while a goal
+   * exists, so the coordinate is pinned before the first turn of another session
+   * can be mistaken for the goal's. Only the first is remembered: a session
+   * opened later must not steal the goal away from the room it is working in,
+   * which is the same defect arriving through a different door.
+   *
+   * A coordinate, so a failure to record it must not fail the round.
+   */
+  private rememberRoom(store: GoalStore, sessionID: string): void {
+    const goal = store.view()
+    if (goal === undefined) return
+    if (store.session !== undefined && store.session.sessionID !== sessionID) return
+    try {
+      store.rememberSession({ id: goal.id, revision: goal.revision }, sessionID)
+    } catch {
+      // a lost race with another writer: the room is a coordinate, not a state verb
+    }
   }
 
   /**

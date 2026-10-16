@@ -291,7 +291,14 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
               // Both stall counters are decided here, before the driver's own
               // completion handler, so a guardrail checked at admission sees the
               // counters the turn that just ended actually produced.
-              accounting.onTurnEnded(directory, sessionID, error !== undefined)
+              //
+              // And the turn is attributed before either half sees it. A turn in
+              // a session the goal is not working in is not the goal's: charging
+              // it advanced the goal into the human's session and then blocked the
+              // goal on the human's tool-less turns. The human reported exactly
+              // that, from two sessions open in one project.
+              const goalTurn = driver.ownsTurn(sessionID, directory)
+              accounting.onTurnEnded(directory, sessionID, error !== undefined, goalTurn)
               // A goal that predates this process is disarmed, and `session.created`
               // cannot re-arm it for a session that already existed — the
               // `opencode run --standalone` and restart cases. A finished human turn
