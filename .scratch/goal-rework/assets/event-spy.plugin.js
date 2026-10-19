@@ -1,0 +1,221 @@
+/**
+ * event-spy — a read-only opencode v2 server plugin.
+ *
+ * Purpose: settle three contested claims about opencode v2 by recording what a
+ * real server actually emits. See
+ * .scratch/goal-rework/issues/01-record-the-real-opencode-v2-event-stream-during-one-goal-run.md
+ *
+ * It changes nothing. It subscribes to the whole event stream, wraps
+ * ctx.session.get, and taps the `prompt` and `context` session hooks, writing
+ * every observation as one JSON object per line.
+ *
+ * Deliberately not a goal plugin: no tools, no prompts, no mutations.
+ */
+
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+
+const OUT = join(process.env.SPY_DIR ?? process.cwd(), '.opencode', 'event-spy.jsonl')
+const MAX_EVENT_CHARS = 40000
+
+let seq = 0
+
+function truncate (value) {
+  let text
+  try {
+    text = JSON.stringify(value)
+  } catch {
+    return { __unserializable: String(value) }
+  }
+  if (text === undefined) return undefined
+  if (text.length <= MAX_EVENT_CHARS) return value
+  return { __truncated: true, originalLength: text.length, head: text.slice(0, 4000), tail: text.slice(-4000) }
+}
+
+function write (kind, payload) {
+  seq += 1
+  const line = JSON.stringify({
+    seq,
+    at: new Date().toISOString(),
+    mono: process.hrtime.bigint().toString(),
+    kind,
+    ...payload,
+  })
+  try {
+    appendFileSync(OUT, `${line}\n`)
+  } catch (error) {
+    // a failed write must never break the host server
+    console.error('[event-spy] write failed', error && error.message)
+  }
+}
+
+function topLevelKeys (value) {
+  if (value === null || typeof value !== 'object') return []
+  if (Array.isArray(value)) return ['(array)']
+  return Object.keys(value)
+}
+
+export const EventSpy = {
+  id: 'event-spy',
+
+  async setup (ctx) {
+    try {
+      mkdirSync(dirname(OUT), { recursive: true })
+      writeFileSync(OUT, '') // one run per file; truncate on boot
+    } catch (error) {
+      console.error('[event-spy] cannot prepare output', error && error.message)
+    }
+
+    write('setup', {
+      pluginId: 'event-spy',
+      location: ctx.location ?? null,
+      appVersion: ctx.app?.version ?? null,
+      ctxKeys: topLevelKeys(ctx),
+      locationKeys: topLevelKeys(ctx.location),
+      hasEventSubscribe: typeof ctx.event?.subscribe === 'function',
+      hasSessionGet: typeof ctx.session?.get === 'function',
+      hasSessionHook: typeof ctx.session?.hook === 'function',
+      hasToolTransform: typeof ctx.tool?.transform === 'function',
+    })
+
+    // ---- wrap ctx.session.get: settle whether SessionInfo carries a top-level
+    // `directory` (v1 shape) or only `location.directory` (v2 shape).
+    const session = ctx.session
+    if (session && typeof session.get === 'function') {
+      const original = session.get.bind(session)
+      session.get = async (input) => {
+        let result
+        let error
+        try {
+          result = await original(input)
+        } catch (caught) {
+          error = caught instanceof Error ? caught.message : String(caught)
+          throw caught
+        }
+        write('session.get.result', {
+          input,
+          error,
+          result: truncate(result),
+          resultKeys: topLevelKeys(result),
+        })
+        return result
+      }
+    }
+
+    // ---- tap the two session hooks, to record their event shapes.
+    if (session && typeof session.hook === 'function') {
+      for (const name of ['prompt', 'context']) {
+        try {
+          await session.hook(name, (event) => {
+            // The submitted text matters for the acceptance run, which has to show
+            // every round's prompt. It is read here rather than by wrapping
+            // `ctx.session.prompt` because that wrapper only sees one plugin's own
+            // submissions, and the goal continuation driver is another plugin — the
+            // version of this spy that tried it recorded nothing at all.
+            if (name === 'prompt') {
+              const text = typeof event?.prompt?.text === 'string' ? event.prompt.text : ''
+              write('session.prompt.submitted', {
+                sessionID: event?.sessionID ?? null,
+                delivery: event?.delivery ?? null,
+                textChars: text.length,
+                text,
+                // round prompts are marked by the renderer; the human's are not
+                looksLikeGoalRound: text.includes('opencode-goal continuation round'),
+              })
+            }
+            // shape only: these payloads are tens of KB and mostly prompt text
+            const shape = {
+              topLevelKeys: topLevelKeys(event),
+              systemIsArray: Array.isArray(event?.system),
+              systemLength: Array.isArray(event?.system) ? event.system.length : undefined,
+              systemPartKeys: Array.isArray(event?.system) && event.system.length > 0 ? topLevelKeys(event.system[0]) : undefined,
+              systemPartTypes: Array.isArray(event?.system) ? event.system.map(part => part?.type ?? typeof part) : undefined,
+              toolsKeys: event?.tools !== null && typeof event?.tools === 'object' ? Object.keys(event.tools).slice(0, 40) : undefined,
+              toolsCount: event?.tools !== null && typeof event?.tools === 'object' ? Object.keys(event.tools).length : undefined,
+              hasMessages: Object.hasOwn(event ?? {}, 'messages'),
+              messageCount: Array.isArray(event?.messages) ? event.messages.length : undefined,
+              modelKeys: topLevelKeys(event?.model),
+            }
+            write(`session.hook.${name}`, { shape })
+            return undefined
+          })
+          write('session.hook.registered', { name })
+        } catch (error) {
+          write('session.hook.registerFailed', { name, error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+    }
+
+    // ---- the event stream itself.
+    const controller = new AbortController()
+    const getProbed = new Set()
+
+    /**
+     * Settle claim 3 directly: call ctx.session.get for a live session and
+     * record the exact shape of what comes back. Executions carry no location,
+     * so a turn event's sessionID is the only handle the driver has — this is
+     * exactly the call src/index.ts makes and reads `info.directory` from.
+     */
+    const probeSessionGet = async (sessionID) => {
+      if (getProbed.has(sessionID)) return
+      getProbed.add(sessionID)
+      if (typeof session?.get !== 'function') {
+        write('session.get.unavailable', { sessionID })
+        return
+      }
+      try {
+        const result = await session.get({ sessionID })
+        write('session.get.result', {
+          sessionID,
+          result,
+          resultKeys: topLevelKeys(result),
+          hasTopLevelDirectory: Object.hasOwn(result ?? {}, 'directory'),
+          topLevelDirectory: result?.directory ?? null,
+          locationKeys: topLevelKeys(result?.location),
+          locationDirectory: result?.location?.directory ?? null,
+          projectID: result?.projectID ?? null,
+          parentID: result?.parentID ?? null,
+        })
+      } catch (error) {
+        write('session.get.error', { sessionID, error: error instanceof Error ? error.message : String(error) })
+      }
+    }
+
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event === null || typeof event !== 'object') {
+            write('event.nonObject', { value: String(event) })
+            continue
+          }
+          const sessionID = event.data?.sessionID
+          if (typeof sessionID === 'string') void probeSessionGet(sessionID)
+          write('event', {
+            event: truncate(event),
+            type: event.type,
+            envelopeKeys: topLevelKeys(event),
+            dataKeys: topLevelKeys(event.data),
+            hasLocation: Object.hasOwn(event, 'location'),
+            location: event.location ?? null,
+            hasLocationDirectory:
+              event.location !== null && typeof event.location === 'object' && Object.hasOwn(event.location, 'directory'),
+            dataHasSessionID:
+              event.data !== null && typeof event.data === 'object' && Object.hasOwn(event.data, 'sessionID'),
+          })
+        }
+        write('event.streamEnded', {})
+      } catch (error) {
+        write('event.streamError', { error: error instanceof Error ? error.message : String(error) })
+      }
+    })()
+
+    write('setup.complete', { out: OUT })
+
+    return async () => {
+      write('teardown', {})
+      controller.abort()
+    }
+  },
+}
+
+export default EventSpy

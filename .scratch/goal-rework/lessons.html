@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>opencode-goal 重构 · 期间的坑</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --line: #2a3441;
+    --text: #dde3ea;
+    --dim: #8b98a8;
+    --faint: #6a7686;
+    --red: #ff7b72;
+    --amber: #e3b341;
+    --green: #56d364;
+    --blue: #79c0ff;
+    --purple: #d2a8ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.72 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 56px 28px 96px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 32px; margin-bottom: 44px; }
+  h1 { font-size: 30px; margin: 0 0 10px; letter-spacing: -0.4px; font-weight: 650; }
+  .sub { color: var(--dim); font-size: 15px; }
+  .meta { display: flex; gap: 26px; flex-wrap: wrap; margin-top: 22px; }
+  .meta div { font-size: 13px; color: var(--faint); }
+  .meta b { display: block; font-size: 22px; color: var(--text); font-weight: 650; letter-spacing: -0.3px; }
+
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1.6px;
+    color: var(--faint); font-weight: 700;
+    margin: 56px 0 20px; padding-bottom: 10px; border-bottom: 1px solid var(--line);
+  }
+  .lead { color: var(--dim); margin: -8px 0 24px; font-size: 14.5px; max-width: 76ch; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 22px 24px; margin-bottom: 14px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 16.5px; font-weight: 620; letter-spacing: -0.2px; }
+  .tag {
+    display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+    padding: 2px 8px; border-radius: 20px; margin-bottom: 12px; text-transform: uppercase;
+  }
+  .t-claim { background: rgba(255,123,114,.13); color: var(--red); }
+  .t-meas  { background: rgba(121,192,255,.13); color: var(--blue); }
+  .t-test  { background: rgba(227,179,65,.13);  color: var(--amber); }
+  .t-ops   { background: rgba(210,168,255,.13); color: var(--purple); }
+  .t-arch  { background: rgba(86,211,100,.13);  color: var(--green); }
+
+  .row { display: grid; grid-template-columns: 88px 1fr; gap: 14px; padding: 7px 0; align-items: baseline; }
+  .row .k { font-size: 11.5px; font-weight: 700; letter-spacing: 0.6px; color: var(--faint); text-transform: uppercase; padding-top: 3px; }
+  .row .v { color: var(--text); }
+  .row .v code, p code, li code {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+    padding: 1px 5px; font-size: 12.5px; color: var(--amber);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .strike { color: var(--faint); text-decoration: line-through; text-decoration-color: rgba(255,123,114,.6); }
+  .fix { color: var(--green); }
+  .lesson {
+    margin-top: 14px; padding: 12px 16px; border-left: 3px solid var(--green);
+    background: rgba(86,211,100,.06); border-radius: 0 6px 6px 0;
+    font-size: 14.5px; color: var(--text);
+  }
+  .lesson b { color: var(--green); font-weight: 650; }
+  .cost {
+    margin-top: 10px; font-size: 13.5px; color: var(--dim);
+    padding-left: 16px; border-left: 3px solid var(--line);
+  }
+  ol.pit { margin: 0; padding-left: 22px; }
+  ol.pit li { margin-bottom: 9px; }
+  ul.pit { margin: 0; padding-left: 20px; }
+  ul.pit li { margin-bottom: 7px; }
+  .num { font-variant-numeric: tabular-nums; color: var(--faint); font-weight: 700; }
+  footer { margin-top: 72px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; }
+  @media (max-width: 640px) { .row { grid-template-columns: 1fr; gap: 2px; } .wrap { padding: 32px 18px 64px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>opencode-goal 重构期间的坑</h1>
+  <div class="sub">从 chart-the-map 到 17 张票全部落地，把每一步真正绊倒过我的东西记下来。</div>
+  <div class="meta">
+    <div><b>17</b>票 (13–29)</div>
+    <div><b>12</b>次提交</div>
+    <div><b>269</b>测试 / 0 失败</div>
+    <div><b>5</b>篇 ADR</div>
+    <div><b>62+</b>条 spec 决策</div>
+    <div><b>3</b>次类型与服务器的矛盾被测量推翻</div>
+  </div>
+</header>
+
+<h2>最重要的四条</h2>
+<p class="lead">如果只留四条，是这四条。其余都是它们的推论。</p>
+
+<div class="card">
+  <span class="tag t-claim">类型 ≠ 事实</span>
+  <h3>我说的"plugin 无法枚举 session"是错的，而错因是我自己写的类型</h3>
+  <div class="row"><div class="k">我曾断言</div><div class="v"><code>session.list</code> 不在 <code>SessionDomain</code> 的 Pick 里，所以插件不可能枚举 session，也就不可能知道"opencode 正在用哪个模型"。</div></div>
+  <div class="row"><div class="k">真相</div><div class="v">这话对 <b>server plugin context</b> 成立，对 <b>TUI plugin context</b> 不成立。它们是两个不同的类型。官方 <code>@opencode/plugin/tui</code> 的 Context 明写 <code>data.session.list(): SessionInfo[]</code> 和 <code>client: OpenCodeClient</code>，而 <code>/goal</code>命令面<b>就是</b> TUI 插件。</div></div>
+  <div class="row"><div class="k">为什么错</div><div class="v"><code>src/tui.tsx</code> 里我手写的 <code>TuiGoalContext</code> 把 <code>data.session</code> 声明得比官方 SDK <b>窄</b>。一个偏窄的类型让能力看起来不存在——于是我用"能力不存在"解释了一个本该去查的现象。</div></div>
+  <div class="row"><div class="k">代价</div><div class="v">用户连着两次报 403。第一次修复读 <code>session.model</code>，第二次才去枚举。</div></div>
+  <div class="lesson"><b>规则：</b>一个类型是我写下的断言，不是世界的描述。当现象和断言冲突时，先怀疑断言——尤其是自己手写的那一份。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-claim">信封 ≠ 数组</span>
+  <h3><code>session.list()</code> 返回的是 <code>{data: []}</code>，我把它当成一行 push 了进去</h3>
+  <div class="row"><div class="k">现象</div><div class="v">修完之后用户仍然 403。日志里 <code>SESSION ... model=None</code>——goal 记住了房间却没记住模型。</div></div>
+  <div class="row"><div class="k">机制</div><div class="v">生成客户端的签名是 <code>(input?) => Promise&lt;SessionsResponse&gt;</code>，而 <code>SessionsResponse = {data: SessionInfo[], cursor}</code>。我的代码把<b>整个信封</b>当成一个 row，于是 <code>row.model</code> 在包装对象上永远是 <code>undefined</code>，每个 session 看起来都没模型。</div></div>
+  <div class="row"><div class="k">更讽刺的</div><div class="v">用户的 step5 选择一直就在 <code>opencode.db</code> 里，同一个项目下，隔着一层信封。</div></div>
+  <div class="lesson"><b>规则：</b>"读到了但值是空的"和"没读到"要分开诊断。前者通常是形状不匹配，后者才是能力缺失——而这两者的修法完全相反。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-test">测试会共谋</span>
+  <h3>有测试把缺陷写成了契约，并且通过</h3>
+  <div class="row"><div class="k">实例 1</div><div class="v">票 27 发现 <code>/goal create</code> 跑第 1 轮、<code>autoStart</code> 跑第 2 轮。而一个<b>既有测试</b>断言那第二轮是正确的——清空 prompts 后的 <code>toBe(1)</code> 量的正是这次双重踢。</div></div>
+  <div class="row"><div class="k">实例 2</div><div class="v">两个测试断言 <code>roundsStarted === 0</code>、零 prompt、以及那句"没有 session 打开"的提示——用户报的缺陷被原样写成了预期行为。</div></div>
+  <div class="row"><div class="k">实例 3</div><div class="v">一个测试的 <code>includes('blocked')</code> 匹配到了<b>它自己 objective 里</b>的词（"a goal that is never blocked"）。标记必须是精确短语 <code>'Goal blocked ('</code>。</div></div>
+  <div class="lesson"><b>规则：</b>测试失败时先问"是这个测试错了，还是它保护的东西错了"。一个能通过的测试不等于一个说了真话的测试。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-test">吞错会栽赃</span>
+  <h3>plugin 的 try/catch 吞掉了测试自己的 ReferenceError，让测试 bug 伪装成能力缺失</h3>
+  <div class="row"><div class="k">现象</div><div class="v">新测试失败在 <code>madeWith[0] === undefined</code>，看起来像"插件读不到模型"。</div></div>
+  <div class="row"><div class="k">真相</div><div class="v">mock 的 <code>list()</code> 闭包引用了一个<b>未声明的自由变量</b>，运行期抛 <code>ReferenceError</code>。插件的 <code>try/catch</code>——它是为了"surface 缺失不至于弄坏 /goal"而<b>正确存在</b>的——把它吞了，落到下一层。</div></div>
+  <div class="row"><div class="k">推论</div><div class="v">一个坏掉的测试和"能力不存在"长得一模一样。</div></div>
+  <div class="lesson"><b>规则：</b>每一层静默失败，都让下面一层成为唯一证据。分层防御越完善，"证据在最后一层"这个陷阱就越深。</div>
+</div>
+
+<h2>一、类型是对服务器的断言</h2>
+<p class="lead">这一类坑的成本最高，因为它让人停止调查。三次矛盾都是测量推翻的，没有一次是读代码读出来的。</p>
+
+<div class="card">
+  <span class="tag t-claim">已声明 · 未发布</span>
+  <h3><code>session.viewed</code> 在协议里声明了，从不发布</h3>
+  <div class="row"><div class="k">测量</div><div class="v">三次成功的 <code>POST /api/session/:id/view</code>（200）→ 563 条记录事件里 <b>0 条</b>。<code>session.*</code> 家族只有两个 <code>session.created</code>。扫全部 563 个类型找 view/focus/open/active/select/enter/resume/load，<b>一个都没有</b>。</div></div>
+  <div class="cost">这是本 effort 第三次"类型与服务器矛盾"（前两次：票 25 的 inbox location、票 16 的扁平 <code>SessionInfo.directory</code>）。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-claim">设置 ≠ 解析</span>
+  <h3><code>session.model</code> 是"被显式设成什么"，不是"服务器解析成什么"</h3>
+  <div class="row"><div class="k">机制</div><div class="v">默认解析发生在 <b>prompt 时</b>，且<b>从不写回</b> session。插件自建的 session 没有 model 字段，读回来就是 <code>undefined</code>。</div></div>
+  <div class="row"><div class="k">反证</div><div class="v"><code>opencode.db</code> 里最近 25 个 session 有 <b>24 个</b>带 model——TUI 的 <code>/model</code> 确实持久化。缺口只在"plugin 自建的 session 没得可读"。</div></div>
+  <div class="row"><div class="k">附带</div><div class="v"><code>session.update</code> <b>不接受</b> model（协议里只有 <code>title</code>/<code>permissions</code>），但 <code>session.switchModel</code> <b>接受</b>。所以旧房间只能被"修"，不能被"补"。</div></div>
+</div>
+
+<div class="card">
+  <span class="tag t-claim">两种拼写</span>
+  <h3>目录比较比的是同一条路径的两种写法</h3>
+  <div class="row"><div class="k">机制</div><div class="v">session 行的 <code>location.directory</code> 用<b>反斜杠</b>，插件自己的 <code>context.location.directory</code> 用<b>正斜杠</b>。原始字符串比较把每一行都过滤掉。</div></div>
+  <div class="cost">这是同一个"什么都读不到"的第二条路。修了信封之后它仍然会让读取归零——两个独立的 bug，同一个症状。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-claim">可选性不一致</span>
+  <h3>JSON body 不是 universally optional，也不是 uniformly required</h3>
+  <ul class="pit">
+    <li><code>session.create</code> 接受 <code>{}</code>，不接受"无 body"（400）</li>
+    <li><code>session.view</code> 拒绝 <code>{}</code>（<code>Expected object</code>），要求 <code>{"idle": &lt;epoch-ms&gt;}</code></li>
+    <li>API 需要 <code>Authorization: Basic base64("opencode:&lt;password&gt;")</code>——裸密码 401，而密码只在启动时打印一次</li>
+  </ul>
+</div>
+
+<div class="card">
+  <span class="tag t-claim">提示词不带模型</span>
+  <h3>续跑提示词的 payload 里根本没有 model 字段</h3>
+  <div class="row"><div class="k">测量</div><div class="v"><code>PromptInput.Prompt</code> 只有 <code>text/files/agents/skills</code>；TUI 自己的调用是 <code>{sessionID, text, files, agents, skills, delivery, gate, prepare}</code>。模型是<b>按 session</b> 解析的。</div></div>
+  <div class="row"><div class="k">后果</div><div class="v">goal 跑在自己没记住的 session 里，就跑服务器默认值——而默认值可以是账号用不了的模型（403）。人类手打一句"1"能好，因为他们正走在 TUI 自己的路径上。</div></div>
+</div>
+
+<h2>二、测试自己的错，长得像插件的错</h2>
+<p class="lead">这一类我全部记了下来，因为每一个都很容易用"弱化断言"糊弄过去。</p>
+
+<div class="card">
+  <span class="tag t-test">四例</span>
+  <h3>四个测试先错后对</h3>
+  <ol class="pit">
+    <li><b>复用测试根本没走到恢复路径。</b>第一轮之后 <code>ensureSession</code> 已导航到那个 session，下一次 <code>/goal</code> 就复用了——这是正确行为，但不是要测的东西。必须先把路由放回 <code>home</code>，那才是恢复可达的状态。</li>
+    <li><b>替换测试把模型设在了 goal 从未用过的 session 上。</b>它从 home 路由起步却把模型设在 <code>ses-goal</code>，而 home 起步会自建 session，所以 goal 正确地没记住模型，测试什么都没证明。</li>
+    <li><b><code>run!('resume in the old room')</code> 不是 resume。</b>参数是 objective，动词必须是光秃秃的 <code>resume</code>。命令静默什么都没做——看起来像插件坏了。</li>
+    <li><b>要证明"房间还在但没模型"，房间必须存在且没模型。</b>把它从 live map 里拿掉意味着"房间没了"，那是另一种情形、会正确地新建。测试断言错了那一边。</li>
+  </ol>
+  <div class="lesson"><b>规则：</b>测试因为自己的错误而失败时，最省事的修法是削弱它。每条这类记录都是为了那时候还能认出真相。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-test">快照 vs 引用</span>
+  <h3>mock 在构建时解构了引用，测试之后替换它就失效</h3>
+  <div class="row"><div class="k">机制</div><div class="v"><code>const {sessions} = harness</code> 拿到的是快照。<code>harness.sessions = [...]</code> 换的是属性，解构出来的 const 还指着旧值。<code>liveSessions</code> 能工作只因为那是<b>同一个 Map 的原地修改</b>。</div></div>
+  <div class="row"><div class="k">修法</div><div class="v">改成可变盒子：<code>collections.sessions</code>，测试往里填。</div></div>
+</div>
+
+<h2>三、机制必须被测量，不能被推断</h2>
+<p class="lead">四个假设里有三个被仪器化否掉。每一次"显而易见的原因"都是错的。</p>
+
+<div class="card">
+  <span class="tag t-meas">票 24</span>
+  <h3>"完成前那一步的 token 永远丢失"——三个假设全错</h3>
+  <div class="row"><div class="k">假设 1</div><div class="v"><code>isGoalTurn</code> 门挡掉了 → <span class="strike">否</span>：四步都到了，没有守卫触发</div></div>
+  <div class="row"><div class="k">假设 2</div><div class="v">调用方过滤掉了 → <span class="strike">否</span></div></div>
+  <div class="row"><div class="k">真相</div><div class="v"><code>GoalStore.addUsage</code> 累进一个<b>内存 overlay</b> 且不落盘；overlay 搭下一次 mutation 走，而 <code>commit()</code> 会清掉它。现场数字：46,196 folded，<b>22,839</b> 记录（正好是步骤 1+2），<code>complete</code> 比步骤 3 早 <b>12ms</b> 盖章。</div></div>
+  <div class="lesson"><b>规则：</b>仪器化要可移除且可证明已移除——用标记文件控制，然后用 <code>dist/index.js</code> 的 md5 与插桩前对比来证明行为保真。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-meas">票 22</span>
+  <h3>"20ms 内 11 次 continue"——四个测量，前三个都排除了</h3>
+  <ol class="pit">
+    <li>执行事件是<b>按 turn</b> 不是按 step（2 步 / 1 成功）→ <span class="strike">排除</span></li>
+    <li>单 session 的 11 次爆发 → <b>1</b> 轮准入，守卫没问题 → <span class="strike">排除</span></li>
+    <li>11 个<b>子</b> session 爆发 → <b>0</b> 轮，过滤有效 → <span class="strike">排除</span></li>
+    <li><b>一个事件扇出到两个 plugin 进程 → 2 轮准入。</b>就是它。</li>
+  </ol>
+  <div class="row"><div class="k">级联</div><div class="v">按 opencode 的提示词合并模型（回合中提交的提示词会打断当前回合，而打断本身又是一个回合完成事件），这个循环能自己跑自己——<b>51ms 内 4 次 continue</b>，每次 <code>in=0 out=0</code>，只被停顿守卫拦住。</div></div>
+</div>
+
+<div class="card">
+  <span class="tag t-arch">缺的是所有权</span>
+  <h3>轮询和定时器都不是答案</h3>
+  <div class="row"><div class="k">测量</div><div class="v"><code>session.viewed</code> 从不发布；插件上下文<b>无法枚举 session</b>（server 侧）；plugin surface 里没有任何文件监视 API。</div></div>
+  <div class="row"><div class="k">诊断</div><div class="v">driver 的 in-flight 账是<b>内存的且按 session 键控</b>的，第二个进程看不到第一个进程的 round。缺的不是观察，是<b>所有权</b>。</div></div>
+  <div class="lesson"><b>规则：</b>当"我希望能看到 X"反复出现时，先问"是谁该拥有 X"。看得见解不了一个没人负责的问题。</div></div>
+</div>
+
+<h2>四、并发与状态</h2>
+
+<div class="card">
+  <span class="tag t-arch">两个问题</span>
+  <h3>"检测到变化"和"判断这是什么变化"必须是两个问题</h3>
+  <div class="row"><div class="k">坑</div><div class="v"><code>sync()</code> 只比 goal 的 <code>id/revision/phase</code>。把 usage 加进去是必要的，但<b>显而易见的版本是回归</b>：<code>applyExternalChange</code> 结尾调 <code>applyActivation</code>，后者从 revision 算 <code>mutatedWhileAlive</code>。usage delta 不动 revision，于是一个 armed store 采用外部 delta 会读成"未在存活期间变更"从而<b>自我解除</b>。</div></div>
+  <div class="row"><div class="k">修法</div><div class="v"><code>stateVerb</code> 旗标——一个坐标不得触发状态动词的后果。</div></div>
+  <div class="lesson"><b>规则：</b>"东西变了"和"该为此做什么"耦合在一起时，加前者的检测会悄悄改后者的行为。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-arch">等待即阻碍</span>
+  <h3>等路由变成 session 路由，就是在等 goal 存在的意义所要消除的那个行为</h3>
+  <div class="row"><div class="k">测量</div><div class="v">在 <code>opencode.exe</code> 里：导航到 <code>{type:"session", sessionID}</code> 位于<b>提示词提交处理函数内部</b>（<code>if (!i.sessionID) { ...; V.navigate(...) }</code>）。所以 <code>&lt;leader&gt;n</code> 开的 session 会让路由停在 <code>home</code>，直到人类发送点什么。</div></div>
+  <div class="row"><div class="k">修法</div><div class="v"><code>ensureSession()</code> 自己造 session，而不是等它出现。且<b>先建 session 再建 goal</b>——反过来会让 server driver 的 <code>session.created</code> 和 TUI 命令面都准入第 1 轮。</div></div>
+</div>
+
+<div class="card">
+  <span class="tag t-arch">坐标不是动词</span>
+  <h3>租约、usage delta、session 记忆共用一条规则：不得 bump revision</h3>
+  <div class="row"><div class="k">规则</div><div class="v">折叠给它们各自的槽位，永不进 goal 累加器、revision 或 <code>lastRef</code>；命名别的 goal 的行被丢弃；<code>clear</code> 一并清掉。</div></div>
+  <div class="row"><div class="k">为什么</div><div class="v">revision 是每个调用方持有的 ref 和 <code>mutatedWhileAlive</code> 读取的坐标。一次 usage 折叠不是状态动词，把它当动词会让每个 ref 变陈、让 armed store 自我解除。</div></div>
+  <div class="cost">代价：<code>sync()</code> 现在要比三样东西而不一样。少比任何一样，另一个进程的写入就无限期不可见。</div>
+</div>
+
+<h2>五、部署与进程</h2>
+
+<div class="card">
+  <span class="tag t-ops">插件在启动时加载</span>
+  <h3>用户侧的 opencode.exe 是旧的，我改了文件也没用</h3>
+  <div class="row"><div class="k">诊断</div><div class="v">每次都用进程启动时间和提交时间对比来排除"陈旧"这个解释——两次都是进程更新，于是确认是真 bug。</div></div>
+  <div class="row"><div class="k">教训</div><div class="v">"你更新了吗"是个真问题，但它<b>不能</b>被当成默认答案。先测量，再怀疑环境。</div></div>
+</div>
+
+<div class="card">
+  <span class="tag t-ops">杀进程的顺序</span>
+  <h3><code>kill_tree</code> 必须先 <code>taskkill /T /F</code> 再 <code>proc.kill()</code></h3>
+  <div class="row"><div class="k">机制</div><div class="v">先杀父进程，<code>taskkill</code> 就只剩一个死 pid 可走，真正的 <code>opencode.exe</code> 会作为孤儿活下来——然后占着端口，让下一轮服务器起不来。</div></div>
+</div>
+
+<div class="card">
+  <span class="tag t-ops">脚本改源码</span>
+  <h3>用 Python heredoc 编辑源码吃掉了 150 行 <code>GoalAccounting</code></h3>
+  <div class="row"><div class="k">机制</div><div class="v">一个"还原"脚本匹配失败后仍执行了替换。文件未被 git 跟踪，无法 <code>git checkout</code> 恢复。</div></div>
+  <div class="row"><div class="k">恢复</div><div class="v">从<b>编译过但未压缩的 <code>dist/index.js</code> 打包产物</b>加早先的 <code>read</code> 输出，手工重建类体；然后 typecheck、全测试、<code>dist</code> md5 一致来证明还原正确。</div></div>
+  <div class="row"><div class="k">同类</div><div class="v">三引号 Python 字符串里的 <code>\n</code> 会静默变成真换行，破坏精确匹配补丁。带空格的路径打断 inline heredoc——写脚本文件，别 inline。</div></div>
+  <div class="lesson"><b>规则：</b>对源码的机械编辑，锚点文本必须精确，且优先用编辑工具而不是脚本。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-ops">静默失败链</span>
+  <h3>插件不加载的四层原因，我前三层都猜错了</h3>
+  <ol class="pit">
+    <li>猜"语法错误"→ <code>bun build</code> 通过，<span class="strike">否</span></li>
+    <li>真相：JS 里 <code>\U</code> <b>不是</b>语法错误，它就是 <code>U</code>。路径变成 <code>C:Users/...</code>，写文件时 ENOENT 抛出</li>
+    <li>猜"项目级 <code>.opencode/plugins</code> 在 serve 里不加载"→ <span class="strike">否</span></li>
+    <li>真相：默认导出必须是 <code>{id, setup}</code> <b>对象</b>。我导出的是一个函数</li>
+  </ol>
+  <div class="cost">这条链本身是个教训：四层静默失败，我用"提升到全局安装"绕过了三层，仍然没找到真因。真正的突破来自去读 <code>Plugin.Plugin</code> 的类型定义。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-ops">写进被操作的目录</span>
+  <h3>把脚本写进它操作的目录，造出了 <code>issues/issues/</code> 双重嵌套</h3>
+  <div class="row"><div class="k">规则</div><div class="v">产出物和输入分开目录。特别是脚本自己要创建目标目录时。</div></div>
+</div>
+
+<h2>六、过程</h2>
+
+<div class="card">
+  <span class="tag t-arch">低于地板的 verdict</span>
+  <h3>Jev 给出 0.59、0.43、0.49 的时候，记下来而不是反复重问到它过线</h3>
+  <div class="row"><div class="k">原则</div><div class="v">每次重问都连同原分数一起记录。票 26 的 0.59（放置位置）重问后 0.81；票 27 的 0.43（日志可读性）从未过线，也留在票里。</div></div>
+  <div class="lesson"><b>规则：</b>逐个地板分重问到过线，和"根本没记录"是同一个动作。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-arch">票界纪律</span>
+  <h3>重构票里不做顺手的行为修改</h3>
+  <div class="row"><div class="k">做法</div><div class="v">每个缺陷开自己的票。于是本轮从 2 张用户报的缺陷长出票 28、29——每张都可独立 review，每个都可被单独证明在 HEAD 上失败。</div></div>
+  <div class="cost">代价是票数变多。收益是"这一版到底改了什么"永远有唯一答案。</div>
+</div>
+
+<div class="card">
+  <span class="tag t-arch">诚实报告</span>
+  <h3>三次我选择把难看的证据写进去</h3>
+  <ol class="pit">
+    <li><b>验收跑只跑了一轮。</b> before/after 各一次，就写在票里，没有抹平。</li>
+    <li><b>字面意义上的"延迟"从未出现。</b>票 27 的活体验证里，第一个进程的 round 在第二个进程的 turn 落地前就完成了 goal。我记录了这一点，外加证明第二个进程的 turn 确实跑过的诊断。</li>
+    <li><b>10 个 stops 测试不能算"在 HEAD 上失败"。</b>它们 import 的新 API 在 HEAD 不存在，所以整个文件<b>加载</b>失败而非断言失败。这不是同一种证据，我没把它当成。真正的证据是用户自己日志里那条 <code>usage-limited</code> + <code>provider.transport</code>。</li>
+  </ol>
+  <div class="lesson"><b>规则：</b>把证据换成更强的那一种很容易，把证据诚实分类才让结论可用。</div>
+</div>
+
+<footer>
+  基于 <code>.scratch/goal-rework/</code> 的 SPEC.md、17 张票、5 篇 ADR、4 份 live 录像与 3 次活体验证生成。
+  每条都标注了它是被测量推翻的，还是被推断误导的——前者是这个 effort 真正的前进方式。
+</footer>
+
+</div>
+</body>
+</html>
