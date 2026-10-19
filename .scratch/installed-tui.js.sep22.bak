@@ -1,0 +1,1106 @@
+// @bun
+// src/tui.tsx
+import { createRoot, createSignal, onCleanup, Show } from "solid-js";
+
+// src/types.ts
+var EMPTY_USAGE = { inputTokens: 0, outputTokens: 0, cost: 0 };
+
+class GoalError extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "GoalError";
+    this.code = code;
+  }
+}
+
+// src/commands.ts
+var USAGE = "Usage: /goal [<objective>|status|edit <objective>|pause|resume|clear] | /goal --tokens <n> <objective> | /goal --rounds <n> <objective>";
+function parseGoalCommand(rawInput) {
+  const input = rawInput.trim();
+  if (input.length === 0)
+    return { kind: "show" };
+  const control = input.toLowerCase();
+  if (control === "status" || control === "show")
+    return { kind: "show" };
+  if (control === "pause")
+    return { kind: "pause" };
+  if (control === "resume")
+    return { kind: "resume" };
+  if (control === "clear")
+    return { kind: "clear" };
+  if (control === "edit")
+    return { kind: "invalid" };
+  if (/^edit(?=\s)/iu.test(input)) {
+    const objective2 = input.slice(4).trim();
+    if (objective2.length === 0)
+      return { kind: "invalid" };
+    return { kind: "edit", objective: objective2 };
+  }
+  let rest = input;
+  let tokenBudget;
+  let maxGoalRounds;
+  const tokenMatch = /^--tokens\s+([0-9]+(?:\.[0-9]+)?[km]?)\s+/i.exec(rest);
+  if (tokenMatch !== null) {
+    tokenBudget = parseBudget(tokenMatch[1]);
+    if (tokenBudget === undefined)
+      return { kind: "invalid" };
+    rest = rest.slice(tokenMatch[0].length);
+  } else if (/^--tokens(?=\s)/i.test(rest)) {
+    return { kind: "invalid" };
+  }
+  const roundMatch = /^--rounds\s+([0-9]+)\s+/i.exec(rest);
+  if (roundMatch !== null) {
+    maxGoalRounds = Number(roundMatch[1]);
+    if (!Number.isSafeInteger(maxGoalRounds) || maxGoalRounds < 1)
+      return { kind: "invalid" };
+    rest = rest.slice(roundMatch[0].length);
+  } else if (/^--rounds(?=\s)/i.test(rest)) {
+    return { kind: "invalid" };
+  }
+  const objective = rest.trim();
+  if (objective.length === 0)
+    return { kind: "invalid" };
+  return { kind: "create", objective, maxGoalRounds, tokenBudget };
+}
+function parseBudget(raw) {
+  const match = /^([0-9]+(?:\.[0-9]+)?)([km]?)$/i.exec(raw);
+  if (match === null)
+    return;
+  const value = Number(match[1]);
+  const suffix = match[2].toLowerCase();
+  const scaled = suffix === "k" ? value * 1000 : suffix === "m" ? value * 1e6 : value;
+  if (!Number.isSafeInteger(scaled) || scaled < 1)
+    return;
+  return scaled;
+}
+function phaseLabel(phase) {
+  return phase;
+}
+function renderGoal(title, goal) {
+  const blocker = goal.phase === "blocked" && goal.blockedReason !== undefined ? [`Blocker: ${goal.blockedReason.code}: ${goal.blockedReason.message}`] : [];
+  const budget = goal.tokenBudget > 0 ? `Budget: ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget} tokens` : "Budget: unlimited";
+  const wait = goal.waitUntil > 0 ? [`Waiting: ${goal.waitReason ?? "external event"} until ${new Date(goal.waitUntil).toISOString()}`] : [];
+  const idle = goal.phase === "active" && goal.activation === "disarmed" ? [`Next step: /goal resume admits round ${goal.roundsStarted + 1}, or open a session and it starts by itself.`] : [];
+  return [
+    title,
+    `Status: ${phaseLabel(goal.phase)} (activation: ${goal.activation})`,
+    ...blocker,
+    ...wait,
+    ...idle,
+    `Objective: ${goal.objective}`,
+    `Rounds: ${goal.roundsStarted}/${goal.maxGoalRounds}`,
+    budget,
+    `Usage: ${goal.usage.inputTokens} in / ${goal.usage.outputTokens} out, cost $${goal.usage.cost.toFixed(4)}`,
+    "",
+    "Commands: /goal status | /goal edit <objective> | /goal pause | /goal resume | /goal clear"
+  ].join(`
+`);
+}
+function goalRef(goal) {
+  return { id: goal.id, revision: goal.revision };
+}
+function executeGoalCommand(store, command) {
+  const current = store.view();
+  const fail = (text) => ({ ok: false, text });
+  const ok = (text) => ({ ok: true, text });
+  try {
+    switch (command.kind) {
+      case "show":
+        return current === undefined ? ok(`No goal is currently set.
+${USAGE}`) : ok(renderGoal("Goal", current));
+      case "invalid":
+        return fail(`Invalid /goal command.
+${USAGE}`);
+      case "create": {
+        const objective = command.objective;
+        if (current !== undefined && current.phase !== "complete") {
+          return fail(`A goal is already ${phaseLabel(current.phase)}. Use /goal edit <objective> to change it or /goal clear before replacing it.`);
+        }
+        const view = store.create(objective, command.maxGoalRounds ?? 25, command.tokenBudget ?? 0);
+        return ok(renderGoal("Goal created (armed, autonomous continuation enabled)", view));
+      }
+      case "edit": {
+        if (current === undefined)
+          return fail(`No goal is currently set; /goal edit requires one.
+${USAGE}`);
+        const view = store.edit(goalRef(current), command.objective, undefined);
+        return ok(renderGoal("Goal updated", view));
+      }
+      case "pause": {
+        if (current === undefined)
+          return fail(`No goal is currently set; /goal pause requires one.
+${USAGE}`);
+        return ok(renderGoal("Goal paused", store.pause(goalRef(current))));
+      }
+      case "resume": {
+        if (current === undefined)
+          return fail(`No goal is currently set; /goal resume requires one.
+${USAGE}`);
+        return ok(renderGoal("Goal resumed (armed)", store.resume(goalRef(current))));
+      }
+      case "clear": {
+        if (current === undefined)
+          return ok("No goal to clear.");
+        store.clear(goalRef(current));
+        return ok("Goal cleared.");
+      }
+    }
+  } catch (error) {
+    if (error instanceof GoalError)
+      return fail(error.message);
+    throw error;
+  }
+}
+
+// src/driver.ts
+function renderGoalRoundPrompt(goal, round) {
+  const budget = goal.tokenBudget > 0 ? ` | budget ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}` : "";
+  return [
+    `[opencode-goal continuation round ${round}/${goal.maxGoalRounds}${budget}]`,
+    "",
+    "You are continuing an autonomous goal. The objective is:",
+    "",
+    goal.objective,
+    "",
+    "Rules for this round:",
+    "- Treat the objective as the task; derive concrete requirements from it and from the current worktree.",
+    "- Verify work against real evidence (commands, tests, files, runtime behavior) before claiming completion.",
+    '- If the objective is fully achieved with evidence, call update_goal with action "complete" and a summary of the evidence.',
+    '- If progress is genuinely blocked by something only the user or an external system can resolve (and the same blocker has persisted for at least 3 goal rounds), call update_goal with action "blocked" with a concrete reason.',
+    "- If you are waiting on an external event (e.g. a monitor or review), call goal_wait with a reason and an optional resume_after_ms deadline instead of looping.",
+    "- Do not claim completion without evidence. Do not mark blocked merely because work is difficult."
+  ].join(`
+`);
+}
+function goalBlockReason(store, goal) {
+  if (store.hasRepeatedRounds()) {
+    return {
+      code: "no-progress",
+      message: "Goal blocked: three consecutive goal rounds produced empty or identical output."
+    };
+  }
+  if (goal.roundsStarted >= goal.maxGoalRounds) {
+    return {
+      code: "round-limit",
+      message: `Goal reached its configured limit of ${goal.maxGoalRounds} rounds.`
+    };
+  }
+  const used = goal.usage.inputTokens + goal.usage.outputTokens;
+  if (goal.tokenBudget > 0 && used >= goal.tokenBudget) {
+    return {
+      code: "budget-limited",
+      message: `Goal reached its token budget of ${goal.tokenBudget} tokens (used ${used}).`
+    };
+  }
+  return;
+}
+
+class GoalDriver {
+  hooks;
+  inflight = new Map;
+  stores = new Map;
+  accounted = new Map;
+  started = new Set;
+  forgotten = new Set;
+  roundsInFlight = new Set;
+  running = new Map;
+  directory = "";
+  constructor(hooks) {
+    this.hooks = hooks;
+  }
+  setDirectory(directory) {
+    this.directory = directory;
+    this.storeFor(directory);
+  }
+  storeFor(directory) {
+    let store = this.stores.get(directory);
+    if (store === undefined) {
+      store = this.hooks.getStore(directory);
+      this.stores.set(directory, store);
+    }
+    return store;
+  }
+  async onSessionCreated(sessionID, directory) {
+    if (this.started.has(sessionID) || this.forgotten.has(sessionID))
+      return;
+    this.started.add(sessionID);
+    const store = this.storeFor(directory);
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active")
+      return;
+    if (store.waitUntil > Date.now())
+      return;
+    const active = this.running.get(directory);
+    if (active !== undefined && active !== sessionID)
+      return;
+    if (this.roundsInFlight.has(sessionID))
+      return;
+    store.activation = "armed";
+    this.hooks.log("goal adopted by new session", { goalID: goal.id, sessionID, round: goal.roundsStarted + 1 });
+    await this.drive(store, sessionID, goal, directory);
+  }
+  async onSessionIdle(sessionID, directory) {
+    if (this.inflight.has(sessionID) || this.forgotten.has(sessionID))
+      return;
+    const run = this.handle(sessionID, directory).catch((error) => {
+      this.hooks.log(`goal round failed: ${error instanceof Error ? error.message : String(error)}`, { sessionID });
+    });
+    this.inflight.set(sessionID, run);
+    try {
+      await run;
+    } finally {
+      this.inflight.delete(sessionID);
+    }
+  }
+  async onTurnFinished(sessionID, directory, reason) {
+    if (this.inflight.has(sessionID) || this.forgotten.has(sessionID))
+      return;
+    const run = this.finish(sessionID, directory, reason).catch((error) => {
+      this.hooks.log(`goal round failed: ${error instanceof Error ? error.message : String(error)}`, { sessionID });
+    });
+    this.inflight.set(sessionID, run);
+    try {
+      await run;
+    } finally {
+      this.inflight.delete(sessionID);
+    }
+  }
+  forget(sessionID) {
+    this.forgotten.add(sessionID);
+    this.started.delete(sessionID);
+    this.accounted.delete(sessionID);
+    this.roundsInFlight.delete(sessionID);
+    this.inflight.delete(sessionID);
+    for (const [directory, active] of this.running) {
+      if (active === sessionID)
+        this.running.delete(directory);
+    }
+  }
+  async handle(sessionID, directory) {
+    if (this.roundsInFlight.has(sessionID))
+      return;
+    const store = this.storeFor(directory);
+    await this.accountSession(sessionID, store);
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active" || goal.activation !== "armed")
+      return;
+    await this.drive(store, sessionID, goal, directory);
+  }
+  async finish(sessionID, directory, reason) {
+    const store = this.storeFor(directory);
+    this.releaseRound(sessionID, directory);
+    await this.accountSession(sessionID, store);
+    if (reason === "user") {
+      this.hooks.log("goal round interrupted by the user; waiting for a human turn", { sessionID });
+      return;
+    }
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active" || goal.activation !== "armed")
+      return;
+    await this.drive(store, sessionID, goal, directory);
+  }
+  async accountSession(sessionID, store) {
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active")
+      return;
+    let messages;
+    try {
+      messages = await this.hooks.session.context({ sessionID });
+    } catch {
+      return;
+    }
+    const seen = this.accounted.get(sessionID);
+    let index = 0;
+    if (seen?.messageID !== undefined) {
+      const found = messages.findIndex((message) => message.id === seen.messageID);
+      if (found >= 0)
+        index = found + 1;
+    }
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cost = 0;
+    let lastID = seen?.messageID;
+    let lastText;
+    for (const message of messages.slice(index)) {
+      if (message.type !== undefined && message.type !== "assistant")
+        continue;
+      inputTokens += message.tokens?.input ?? 0;
+      outputTokens += message.tokens?.output ?? 0;
+      cost += message.cost ?? 0;
+      if (message.id !== undefined)
+        lastID = message.id;
+      const text = (message.content ?? []).filter((part) => part.type === "text").map((part) => part.text ?? "").join(`
+`);
+      if (text.trim().length > 0)
+        lastText = text;
+    }
+    if (inputTokens > 0 || outputTokens > 0 || cost > 0) {
+      store.addUsage({ inputTokens, outputTokens, cost });
+    }
+    if (lastText !== undefined)
+      store.recordRoundOutput(lastText);
+    this.accounted.set(sessionID, {
+      messageID: lastID,
+      inputTokens: (seen?.inputTokens ?? 0) + inputTokens,
+      outputTokens: (seen?.outputTokens ?? 0) + outputTokens
+    });
+  }
+  async drive(store, sessionID, goal, directory) {
+    if (this.roundsInFlight.has(sessionID))
+      return;
+    const now = Date.now();
+    if (store.waitUntil > 0) {
+      if (store.waitUntil > now)
+        return;
+      store.waitUntil = 0;
+      store.waitReason = undefined;
+    }
+    const blockReason = goalBlockReason(store, goal);
+    if (blockReason !== undefined) {
+      this.blockSafely(store, goal, blockReason);
+      return;
+    }
+    const round = goal.roundsStarted + 1;
+    const text = renderGoalRoundPrompt(goal, round);
+    let admitted;
+    try {
+      admitted = store.continue({ id: goal.id, revision: goal.revision });
+    } catch (error) {
+      this.hooks.log(`goal round not admitted: ${error instanceof Error ? error.message : String(error)}`, {
+        goalID: goal.id,
+        round
+      });
+      return;
+    }
+    this.hooks.log("goal round started", { goalID: goal.id, round, revision: admitted.revision });
+    this.roundsInFlight.add(sessionID);
+    this.running.set(directory, sessionID);
+    this.hooks.session.prompt({ sessionID, text }).then(() => {}).catch((error) => {
+      this.hooks.log(`goal round errored: ${error instanceof Error ? error.message : String(error)}`, {
+        goalID: goal.id,
+        round
+      });
+      store.activation = "disarmed";
+      this.releaseRound(sessionID, directory);
+    });
+  }
+  blockSafely(store, goal, blockReason) {
+    try {
+      store.block({ id: goal.id, revision: goal.revision }, blockReason);
+      this.hooks.log(`goal blocked: ${blockReason.code}`, { goalID: goal.id });
+    } catch (error) {
+      this.hooks.log(`goal block skipped: ${error instanceof Error ? error.message : String(error)}`, { goalID: goal.id });
+    }
+  }
+  releaseRound(sessionID, directory) {
+    this.roundsInFlight.delete(sessionID);
+    if (this.running.get(directory) === sessionID)
+      this.running.delete(directory);
+  }
+}
+
+// src/state.ts
+import { randomUUID } from "crypto";
+import { mkdirSync, readFileSync, appendFileSync, existsSync } from "fs";
+import { dirname } from "path";
+var GOAL_CHANGE_VERSION = 1;
+function normalizeSnapshot(snapshot) {
+  const budget = snapshot.tokenBudget;
+  if (typeof budget === "number" && Number.isFinite(budget) && budget > 0)
+    return snapshot;
+  return { ...snapshot, tokenBudget: 0 };
+}
+function sameGoal(a, b) {
+  if (a === undefined || b === undefined)
+    return a === b;
+  return a.id === b.id && a.revision === b.revision && a.phase === b.phase;
+}
+function foldGoalLog(lines) {
+  let goal;
+  let lastRef;
+  for (const line of lines) {
+    if (line.trim().length === 0)
+      continue;
+    let change;
+    try {
+      change = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (change.kind !== "goal/change" || change.version !== GOAL_CHANGE_VERSION)
+      continue;
+    if (change.operation === "clear") {
+      goal = undefined;
+      lastRef = change.cleared;
+    } else {
+      goal = normalizeSnapshot(change.goal);
+      lastRef = { id: change.goal.id, revision: change.goal.revision };
+    }
+  }
+  return { goal, lastRef };
+}
+function emptyRuntime() {
+  return {
+    activation: "disarmed",
+    waitUntil: 0,
+    waitReason: undefined,
+    recentOutputs: []
+  };
+}
+
+class GoalStore {
+  logPath;
+  state;
+  runtime;
+  seq = 0;
+  bornWith;
+  constructor(worktree) {
+    this.logPath = `${worktree}/.opencode/goal-log.jsonl`;
+    this.runtime = emptyRuntime();
+    this.state = { goal: undefined, lastRef: undefined };
+    if (existsSync(this.logPath)) {
+      const lines = readFileSync(this.logPath, "utf8").split(`
+`);
+      this.state = foldGoalLog(lines);
+      this.seq = lines.filter((l) => l.trim().length > 0).length;
+    }
+    const born = this.state.goal;
+    this.bornWith = born === undefined ? undefined : { id: born.id, revision: born.revision };
+    this.applyActivation(born);
+  }
+  applyActivation(goal) {
+    const mutatedWhileAlive = goal !== undefined && (this.bornWith === undefined || goal.id !== this.bornWith.id || goal.revision > this.bornWith.revision);
+    this.runtime.activation = goal !== undefined && goal.phase === "active" && mutatedWhileAlive ? "armed" : "disarmed";
+  }
+  sync() {
+    if (!existsSync(this.logPath)) {
+      const previous2 = this.state.goal;
+      if (previous2 === undefined)
+        return;
+      this.state = { goal: undefined, lastRef: this.state.lastRef };
+      this.applyExternalChange(previous2, undefined);
+      return;
+    }
+    let lines;
+    try {
+      lines = readFileSync(this.logPath, "utf8").split(`
+`);
+    } catch {
+      return;
+    }
+    const folded = foldGoalLog(lines);
+    const previous = this.state.goal;
+    if (sameGoal(previous, folded.goal))
+      return;
+    this.state = folded;
+    this.applyExternalChange(previous, folded.goal);
+  }
+  applyExternalChange(previous, next) {
+    if (next === undefined) {
+      this.runtime.activation = "disarmed";
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+      this.runtime.recentOutputs.length = 0;
+      this.usageOverlay = undefined;
+      return;
+    }
+    const replaced = previous === undefined || previous.id !== next.id;
+    if (replaced || next.phase !== previous?.phase) {
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+      this.runtime.recentOutputs.length = 0;
+    }
+    if (replaced)
+      this.usageOverlay = undefined;
+    this.applyActivation(next);
+  }
+  get current() {
+    return this.state.goal;
+  }
+  get activation() {
+    return this.runtime.activation;
+  }
+  set activation(value) {
+    this.runtime.activation = value;
+  }
+  get tokenBudget() {
+    return this.view()?.tokenBudget ?? 0;
+  }
+  get waitUntil() {
+    return this.runtime.waitUntil;
+  }
+  set waitUntil(value) {
+    this.runtime.waitUntil = value;
+  }
+  get waitReason() {
+    return this.runtime.waitReason;
+  }
+  set waitReason(value) {
+    this.runtime.waitReason = value;
+  }
+  view() {
+    this.sync();
+    const goal = this.state.goal;
+    if (goal === undefined)
+      return;
+    return {
+      ...goal,
+      usage: this.effectiveUsage(goal),
+      activation: this.runtime.activation,
+      waitUntil: this.runtime.waitUntil,
+      waitReason: this.runtime.waitReason
+    };
+  }
+  static normalizeOutput(text) {
+    return text.normalize("NFKC").toLowerCase().replace(/[\u0000-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
+  }
+  recordRoundOutput(output) {
+    const normalized = GoalStore.normalizeOutput(output);
+    const recent = this.runtime.recentOutputs;
+    if (normalized.length === 0) {
+      if (recent.length > 0 && recent[recent.length - 1] === "") {
+        recent.push("");
+      } else {
+        recent.length = 0;
+        recent.push("");
+      }
+    } else if (recent.length > 0 && recent[recent.length - 1] === normalized) {
+      recent.push(normalized);
+    } else {
+      recent.length = 0;
+      recent.push(normalized);
+    }
+    if (recent.length > 3)
+      recent.splice(0, recent.length - 3);
+    return recent.length >= 3;
+  }
+  hasRepeatedRounds() {
+    return this.runtime.recentOutputs.length >= 3;
+  }
+  resetNoProgress() {
+    this.runtime.recentOutputs.length = 0;
+  }
+  addUsage(usage) {
+    const goal = this.state.goal;
+    if (goal === undefined)
+      return;
+    const current = goal.usage;
+    const next = {
+      inputTokens: current.inputTokens + (usage.inputTokens ?? 0),
+      outputTokens: current.outputTokens + (usage.outputTokens ?? 0),
+      cost: current.cost + (usage.cost ?? 0)
+    };
+    this.usageOverlay = next;
+  }
+  usageOverlay;
+  effectiveUsage(goal) {
+    return this.usageOverlay ?? goal.usage;
+  }
+  expectCurrent(ref) {
+    this.sync();
+    const current = this.state.goal;
+    if (current === undefined)
+      throw new GoalError("GOAL_NOT_FOUND", "no current goal");
+    if (ref.id !== current.id || ref.revision !== current.revision) {
+      throw new GoalError("GOAL_STALE_REVISION", `stale goal ref "${ref.id}" revision ${ref.revision}; current is "${current.id}" revision ${current.revision}`);
+    }
+    return current;
+  }
+  commit(change) {
+    mkdirSync(dirname(this.logPath), { recursive: true });
+    appendFileSync(this.logPath, `${JSON.stringify(change)}
+`);
+    this.seq += 1;
+    if (change.operation === "clear") {
+      this.state = { goal: undefined, lastRef: change.cleared };
+    } else {
+      this.state = { goal: change.goal, lastRef: { id: change.goal.id, revision: change.goal.revision } };
+    }
+    this.usageOverlay = undefined;
+  }
+  snapshotWithUsage(base, usage) {
+    return { ...base, usage: usage ?? EMPTY_USAGE };
+  }
+  nextTime(goal) {
+    return Math.max(Date.now(), goal.updatedAt);
+  }
+  static resolveTokenBudget(value) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new GoalError("GOAL_INVALID_TOKEN_BUDGET", "tokenBudget must be a non-negative safe integer (0 = unlimited)");
+    }
+    return value;
+  }
+  static resolveMaxGoalRounds(value) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new GoalError("GOAL_INVALID_MAX_ROUNDS", "maxGoalRounds must be a positive safe integer");
+    }
+    return value;
+  }
+  static resolveObjective(value) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new GoalError("GOAL_INVALID_OBJECTIVE", "goal objective must be a non-empty string");
+    }
+    return value.trim();
+  }
+  static resolveBlockReason(reason) {
+    const code = reason.code;
+    const message = reason.message;
+    if (typeof code !== "string" || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(code) || typeof message !== "string" || message.trim().length === 0) {
+      throw new GoalError("GOAL_INVALID_BLOCK_REASON", "block reason requires a lower-kebab-case code and a non-empty message");
+    }
+    return { code, message: message.trim() };
+  }
+  create(objective, maxGoalRounds, tokenBudget) {
+    const resolvedObjective = GoalStore.resolveObjective(objective);
+    const resolvedRounds = GoalStore.resolveMaxGoalRounds(maxGoalRounds);
+    const resolvedBudget = GoalStore.resolveTokenBudget(tokenBudget);
+    this.sync();
+    const current = this.state.goal;
+    if (current !== undefined && current.phase !== "complete") {
+      throw new GoalError("GOAL_ALREADY_EXISTS", `goal "${current.id}" already exists with phase "${current.phase}"`);
+    }
+    const now = Date.now();
+    const goal = this.snapshotWithUsage({
+      id: `goal-${randomUUID()}`,
+      revision: 1,
+      objective: resolvedObjective,
+      phase: "active",
+      maxGoalRounds: resolvedRounds,
+      tokenBudget: resolvedBudget,
+      createdAt: now,
+      updatedAt: now,
+      roundsStarted: 0
+    }, this.usageOverlay);
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "create",
+      goal
+    });
+    this.runtime.activation = "armed";
+    this.runtime.waitUntil = 0;
+    this.runtime.waitReason = undefined;
+    this.resetNoProgress();
+    return this.view();
+  }
+  edit(ref, objective, maxGoalRounds) {
+    const current = this.expectCurrent(ref);
+    if (objective === undefined && maxGoalRounds === undefined) {
+      throw new GoalError("GOAL_INVALID_EDIT", "goal edit requires objective and/or maxGoalRounds");
+    }
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      objective: objective === undefined ? current.objective : GoalStore.resolveObjective(objective),
+      maxGoalRounds: maxGoalRounds === undefined ? current.maxGoalRounds : GoalStore.resolveMaxGoalRounds(maxGoalRounds),
+      updatedAt: this.nextTime(current)
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "edit",
+      goal
+    });
+    this.resetNoProgress();
+    return this.view();
+  }
+  transition(ref, operation, allowed, phase, activation, blockedReason) {
+    const current = this.expectCurrent(ref);
+    if (!allowed.includes(current.phase)) {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `cannot ${operation} goal "${current.id}" from phase "${current.phase}"; expected ${allowed.join(" or ")}`);
+    }
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      phase,
+      updatedAt: this.nextTime(current),
+      ...blockedReason === undefined ? {} : { blockedReason: GoalStore.resolveBlockReason(blockedReason) }
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation,
+      goal
+    });
+    this.runtime.activation = activation;
+    if (operation === "resume") {
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+      this.resetNoProgress();
+    }
+    if (operation === "block" || operation === "complete") {
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+    }
+    return this.view();
+  }
+  pause(ref) {
+    return this.transition(ref, "pause", ["active"], "paused", "disarmed");
+  }
+  resume(ref) {
+    const current = this.expectCurrent(ref);
+    if (current.phase === "active" && this.runtime.activation === "armed") {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `goal "${current.id}" is already active and armed`);
+    }
+    if (current.roundsStarted >= current.maxGoalRounds) {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `goal "${current.id}" exhausted ${current.maxGoalRounds} goal rounds; increase maxGoalRounds before resuming`);
+    }
+    return this.transition(ref, "resume", ["active", "paused", "blocked"], "active", "armed");
+  }
+  complete(ref) {
+    return this.transition(ref, "complete", ["active", "paused", "blocked"], "complete", "disarmed");
+  }
+  block(ref, reason) {
+    return this.transition(ref, "block", ["active"], "blocked", "disarmed", reason);
+  }
+  continue(ref) {
+    const current = this.expectCurrent(ref);
+    if (current.phase !== "active") {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `cannot continue goal "${current.id}" from phase "${current.phase}"`);
+    }
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      roundsStarted: current.roundsStarted + 1,
+      updatedAt: this.nextTime(current)
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "continue",
+      goal
+    });
+    return this.view();
+  }
+  wait(ref, reason, resumeAfterMs) {
+    const current = this.expectCurrent(ref);
+    if (current.phase !== "active") {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `cannot wait on goal "${current.id}" from phase "${current.phase}"`);
+    }
+    if (typeof reason !== "string" || reason.trim().length === 0 || reason.length > 1000) {
+      throw new GoalError("GOAL_INVALID_EDIT", "wait reason must be 1-1000 characters");
+    }
+    const now = Date.now();
+    const clamped = resumeAfterMs === undefined ? undefined : Math.max(resumeAfterMs, 1e4);
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: this.nextTime(current)
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "wait",
+      goal
+    });
+    this.runtime.waitReason = reason.trim();
+    this.runtime.waitUntil = clamped === undefined ? 0 : now + clamped;
+    return this.view();
+  }
+  clear(ref) {
+    const current = this.expectCurrent(ref);
+    const tombstone = { id: current.id, revision: current.revision + 1 };
+    const change = {
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "clear",
+      cleared: tombstone,
+      clearedAt: Date.now()
+    };
+    this.commit(change);
+    this.runtime.activation = "disarmed";
+    this.runtime.waitUntil = 0;
+    this.runtime.waitReason = undefined;
+    this.resetNoProgress();
+  }
+}
+
+// src/tui.tsx
+import { jsxDEV, Fragment } from "@opentui/solid/jsx-dev-runtime";
+var DEFAULT_REFRESH_INTERVAL_MS = 1000;
+var STATUS_TOAST_MS = 8000;
+var ACTION_TOAST_MS = 5000;
+var NO_SESSION_HINT = "No session is open in this project, so the goal has nothing to run in yet. Open a session here and it starts on its own \u2014 no /goal resume needed.";
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function openStore(directory) {
+  return new GoalStore(directory);
+}
+function isRunning(context, sessionID) {
+  try {
+    return context.data?.session?.status?.(sessionID) === "running";
+  } catch {
+    return false;
+  }
+}
+function shouldKickRound(command, before, after) {
+  if (after === undefined || after.phase !== "active")
+    return false;
+  switch (command.kind) {
+    case "create":
+      return before === undefined || before.id !== after.id;
+    case "edit":
+    case "resume":
+      return before !== undefined && before.id === after.id && after.revision > before.revision;
+    default:
+      return false;
+  }
+}
+function truncateObjective(objective, max = 60) {
+  const singleLine = objective.replace(/\s+/g, " ").trim();
+  return singleLine.length > max ? `${singleLine.slice(0, max - 1)}\u2026` : singleLine;
+}
+function goalSidebarSummary(goal) {
+  if (goal === undefined)
+    return { headline: "No goal \u2014 /goal <objective>", detail: "" };
+  const progress = goal.tokenBudget > 0 ? `rounds ${goal.roundsStarted}/${goal.maxGoalRounds} \xB7 tokens ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}` : `rounds ${goal.roundsStarted}/${goal.maxGoalRounds}`;
+  const badge = goal.phase === "blocked" ? `blocked: ${goal.blockedReason?.code ?? "unknown"}` : goal.phase;
+  return { headline: `${badge} \xB7 ${truncateObjective(goal.objective)}`, detail: progress };
+}
+function GoalSidebarView(props) {
+  const summary = goalSidebarSummary(props.goal);
+  return /* @__PURE__ */ jsxDEV("box", {
+    flexDirection: "column",
+    style: { padding: 1 },
+    children: /* @__PURE__ */ jsxDEV(Show, {
+      when: props.goal,
+      fallback: /* @__PURE__ */ jsxDEV("text", {
+        style: { fg: "gray" },
+        children: summary.headline
+      }, undefined, false, undefined, this),
+      children: (goal) => {
+        const view = goal();
+        return /* @__PURE__ */ jsxDEV(Fragment, {
+          children: [
+            /* @__PURE__ */ jsxDEV("text", {
+              children: summary.headline
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsxDEV("text", {
+              style: { fg: "gray" },
+              children: summary.detail
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsxDEV("box", {
+              flexDirection: "row",
+              style: { gap: 1 },
+              children: [
+                view.phase === "active" ? /* @__PURE__ */ jsxDEV("text", {
+                  style: { fg: "gray" },
+                  onMouseUp: () => props.onCommand("pause"),
+                  children: "pause"
+                }, undefined, false, undefined, this) : /* @__PURE__ */ jsxDEV("text", {
+                  style: { fg: "gray" },
+                  onMouseUp: () => props.onCommand("resume"),
+                  children: "resume"
+                }, undefined, false, undefined, this),
+                /* @__PURE__ */ jsxDEV("text", {
+                  style: { fg: "gray" },
+                  onMouseUp: () => props.onCommand("clear"),
+                  children: "clear"
+                }, undefined, false, undefined, this)
+              ]
+            }, undefined, true, undefined, this)
+          ]
+        }, undefined, true, undefined, this);
+      }
+    }, undefined, false, undefined, this)
+  }, undefined, false, undefined, this);
+}
+function createGoalTuiPlugin(options = {}) {
+  const refreshIntervalMs = options.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
+  return {
+    id: "opencode-goal.tui",
+    setup(context) {
+      return createRoot((dispose) => {
+        const directory = () => context.location?.directory ?? "";
+        const sessionID = () => {
+          const route = context.ui.router.current();
+          return route?.type === "session" ? route.sessionID ?? "" : "";
+        };
+        const toast = (variant, message, duration) => {
+          try {
+            context.ui.toast.show({ variant, message, duration });
+          } catch {}
+        };
+        const kickRound = async (store) => {
+          const id = sessionID();
+          if (id.length === 0) {
+            toast("info", NO_SESSION_HINT, ACTION_TOAST_MS);
+            return;
+          }
+          if (isRunning(context, id))
+            return;
+          const goal = store.view();
+          if (goal === undefined || goal.phase !== "active")
+            return;
+          if (store.waitUntil > Date.now())
+            return;
+          const blockReason = goalBlockReason(store, goal);
+          if (blockReason !== undefined) {
+            store.block({ id: goal.id, revision: goal.revision }, blockReason);
+            toast("warning", `Goal blocked (${blockReason.code}): ${blockReason.message}`, ACTION_TOAST_MS);
+            return;
+          }
+          const admitted = store.continue({ id: goal.id, revision: goal.revision });
+          try {
+            await context.client?.session?.prompt({
+              sessionID: id,
+              text: renderGoalRoundPrompt(admitted, admitted.roundsStarted)
+            });
+          } catch (error) {
+            toast("error", `Goal round ${admitted.roundsStarted} failed to start: ${errorMessage(error)}`, ACTION_TOAST_MS);
+          }
+        };
+        const promptObjective = async () => {
+          try {
+            const value = await context.ui.dialog.prompt({
+              title: "Set goal",
+              description: "What should the agent pursue autonomously?",
+              placeholder: "objective"
+            });
+            const objective = value?.trim() ?? "";
+            return objective.length > 0 ? objective : undefined;
+          } catch {
+            return;
+          }
+        };
+        const confirmReplace = async (current, objective) => {
+          try {
+            return await context.ui.dialog.confirm({
+              title: "Replace goal?",
+              message: `A goal is already ${current.phase}: "${truncateObjective(current.objective, 40)}". Clear it and start "${truncateObjective(objective, 40)}"?`,
+              label: { confirm: "Replace" }
+            });
+          } catch {
+            return false;
+          }
+        };
+        const runGoalCommand = async (rawInput) => {
+          const dir = directory();
+          if (dir.length === 0) {
+            toast("error", "opencode-goal: no project directory is active.", ACTION_TOAST_MS);
+            return;
+          }
+          const command = parseGoalCommand(rawInput);
+          const store = openStore(dir);
+          const before = store.view();
+          if (rawInput.trim().length === 0 && command.kind === "show" && before === undefined) {
+            const objective = await promptObjective();
+            if (objective === undefined)
+              return;
+            await runGoalCommand(objective);
+            return;
+          }
+          if (command.kind === "create" && before !== undefined && before.phase !== "complete") {
+            const objective = command.objective ?? "";
+            if (!await confirmReplace(before, objective)) {
+              toast("info", "Kept the current goal. /goal status shows it.", ACTION_TOAST_MS);
+              return;
+            }
+            executeGoalCommand(store, parseGoalCommand("clear"));
+          }
+          let outcome;
+          try {
+            outcome = executeGoalCommand(store, command);
+          } catch (error) {
+            toast("error", errorMessage(error), ACTION_TOAST_MS);
+            return;
+          }
+          const show = command.kind === "show";
+          const variant = outcome.ok ? show ? "info" : "success" : command.kind === "invalid" ? "error" : "warning";
+          toast(variant, outcome.text, show ? STATUS_TOAST_MS : ACTION_TOAST_MS);
+          const after = store.view();
+          if (shouldKickRound(command, before, after))
+            await kickRound(store);
+        };
+        const layer = () => ({
+          mode: "global",
+          commands: [
+            {
+              id: "goal.command",
+              title: "Goal: set or manage",
+              description: "/goal [<objective>|status|edit <objective>|pause|resume|clear]",
+              group: "Goal",
+              palette: true,
+              slash: { name: "goal", arguments: true },
+              run: (input) => runGoalCommand(input ?? "")
+            },
+            {
+              id: "goal.status",
+              title: "Goal: status",
+              description: "Show the current goal, rounds, and budget",
+              group: "Goal",
+              palette: true,
+              run: () => runGoalCommand("status")
+            },
+            {
+              id: "goal.pause",
+              title: "Goal: pause",
+              description: "Stop autonomous continuation",
+              group: "Goal",
+              palette: true,
+              run: () => runGoalCommand("pause")
+            },
+            {
+              id: "goal.resume",
+              title: "Goal: resume",
+              description: "Resume and re-arm the current goal",
+              group: "Goal",
+              palette: true,
+              run: () => runGoalCommand("resume")
+            },
+            {
+              id: "goal.clear",
+              title: "Goal: clear",
+              description: "Clear the current goal",
+              group: "Goal",
+              palette: true,
+              run: () => runGoalCommand("clear")
+            }
+          ],
+          bindings: []
+        });
+        context.ui.slot?.({
+          append: "app",
+          render: () => {
+            context.keymap.layer(layer);
+          }
+        });
+        const [tick, setTick] = createSignal(0);
+        const bump = () => {
+          setTick((value) => value + 1);
+        };
+        const unsubscribe = context.data?.on?.("session.execution.succeeded", bump);
+        const interval = refreshIntervalMs > 0 ? setInterval(bump, refreshIntervalMs) : undefined;
+        onCleanup(() => {
+          if (interval !== undefined)
+            clearInterval(interval);
+          unsubscribe?.();
+        });
+        context.ui.slot?.({
+          append: "sidebar.content",
+          render: () => {
+            tick();
+            const goal = directory().length > 0 ? openStore(directory()).view() : undefined;
+            return /* @__PURE__ */ jsxDEV(GoalSidebarView, {
+              goal,
+              onCommand: (command) => void runGoalCommand(command)
+            }, undefined, false, undefined, this);
+          }
+        });
+        return () => {
+          dispose();
+        };
+      });
+    }
+  };
+}
+var goalTuiPlugin = createGoalTuiPlugin();
+var tui_default = goalTuiPlugin;
+export {
+  goalTuiPlugin,
+  goalSidebarSummary,
+  tui_default as default,
+  createGoalTuiPlugin
+};

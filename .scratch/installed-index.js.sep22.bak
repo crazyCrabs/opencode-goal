@@ -1,0 +1,1028 @@
+// @bun
+// src/driver.ts
+function renderGoalRoundPrompt(goal, round) {
+  const budget = goal.tokenBudget > 0 ? ` | budget ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}` : "";
+  return [
+    `[opencode-goal continuation round ${round}/${goal.maxGoalRounds}${budget}]`,
+    "",
+    "You are continuing an autonomous goal. The objective is:",
+    "",
+    goal.objective,
+    "",
+    "Rules for this round:",
+    "- Treat the objective as the task; derive concrete requirements from it and from the current worktree.",
+    "- Verify work against real evidence (commands, tests, files, runtime behavior) before claiming completion.",
+    '- If the objective is fully achieved with evidence, call update_goal with action "complete" and a summary of the evidence.',
+    '- If progress is genuinely blocked by something only the user or an external system can resolve (and the same blocker has persisted for at least 3 goal rounds), call update_goal with action "blocked" with a concrete reason.',
+    "- If you are waiting on an external event (e.g. a monitor or review), call goal_wait with a reason and an optional resume_after_ms deadline instead of looping.",
+    "- Do not claim completion without evidence. Do not mark blocked merely because work is difficult."
+  ].join(`
+`);
+}
+function goalBlockReason(store, goal) {
+  if (store.hasRepeatedRounds()) {
+    return {
+      code: "no-progress",
+      message: "Goal blocked: three consecutive goal rounds produced empty or identical output."
+    };
+  }
+  if (goal.roundsStarted >= goal.maxGoalRounds) {
+    return {
+      code: "round-limit",
+      message: `Goal reached its configured limit of ${goal.maxGoalRounds} rounds.`
+    };
+  }
+  const used = goal.usage.inputTokens + goal.usage.outputTokens;
+  if (goal.tokenBudget > 0 && used >= goal.tokenBudget) {
+    return {
+      code: "budget-limited",
+      message: `Goal reached its token budget of ${goal.tokenBudget} tokens (used ${used}).`
+    };
+  }
+  return;
+}
+
+class GoalDriver {
+  hooks;
+  inflight = new Map;
+  stores = new Map;
+  accounted = new Map;
+  started = new Set;
+  forgotten = new Set;
+  roundsInFlight = new Set;
+  running = new Map;
+  directory = "";
+  constructor(hooks) {
+    this.hooks = hooks;
+  }
+  setDirectory(directory) {
+    this.directory = directory;
+    this.storeFor(directory);
+  }
+  storeFor(directory) {
+    let store = this.stores.get(directory);
+    if (store === undefined) {
+      store = this.hooks.getStore(directory);
+      this.stores.set(directory, store);
+    }
+    return store;
+  }
+  async onSessionCreated(sessionID, directory) {
+    if (this.started.has(sessionID) || this.forgotten.has(sessionID))
+      return;
+    this.started.add(sessionID);
+    const store = this.storeFor(directory);
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active")
+      return;
+    if (store.waitUntil > Date.now())
+      return;
+    const active = this.running.get(directory);
+    if (active !== undefined && active !== sessionID)
+      return;
+    if (this.roundsInFlight.has(sessionID))
+      return;
+    store.activation = "armed";
+    this.hooks.log("goal adopted by new session", { goalID: goal.id, sessionID, round: goal.roundsStarted + 1 });
+    await this.drive(store, sessionID, goal, directory);
+  }
+  async onSessionIdle(sessionID, directory) {
+    if (this.inflight.has(sessionID) || this.forgotten.has(sessionID))
+      return;
+    const run = this.handle(sessionID, directory).catch((error) => {
+      this.hooks.log(`goal round failed: ${error instanceof Error ? error.message : String(error)}`, { sessionID });
+    });
+    this.inflight.set(sessionID, run);
+    try {
+      await run;
+    } finally {
+      this.inflight.delete(sessionID);
+    }
+  }
+  async onTurnFinished(sessionID, directory, reason) {
+    if (this.inflight.has(sessionID) || this.forgotten.has(sessionID))
+      return;
+    const run = this.finish(sessionID, directory, reason).catch((error) => {
+      this.hooks.log(`goal round failed: ${error instanceof Error ? error.message : String(error)}`, { sessionID });
+    });
+    this.inflight.set(sessionID, run);
+    try {
+      await run;
+    } finally {
+      this.inflight.delete(sessionID);
+    }
+  }
+  forget(sessionID) {
+    this.forgotten.add(sessionID);
+    this.started.delete(sessionID);
+    this.accounted.delete(sessionID);
+    this.roundsInFlight.delete(sessionID);
+    this.inflight.delete(sessionID);
+    for (const [directory, active] of this.running) {
+      if (active === sessionID)
+        this.running.delete(directory);
+    }
+  }
+  async handle(sessionID, directory) {
+    if (this.roundsInFlight.has(sessionID))
+      return;
+    const store = this.storeFor(directory);
+    await this.accountSession(sessionID, store);
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active" || goal.activation !== "armed")
+      return;
+    await this.drive(store, sessionID, goal, directory);
+  }
+  async finish(sessionID, directory, reason) {
+    const store = this.storeFor(directory);
+    this.releaseRound(sessionID, directory);
+    await this.accountSession(sessionID, store);
+    if (reason === "user") {
+      this.hooks.log("goal round interrupted by the user; waiting for a human turn", { sessionID });
+      return;
+    }
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active" || goal.activation !== "armed")
+      return;
+    await this.drive(store, sessionID, goal, directory);
+  }
+  async accountSession(sessionID, store) {
+    const goal = store.view();
+    if (goal === undefined || goal.phase !== "active")
+      return;
+    let messages;
+    try {
+      messages = await this.hooks.session.context({ sessionID });
+    } catch {
+      return;
+    }
+    const seen = this.accounted.get(sessionID);
+    let index = 0;
+    if (seen?.messageID !== undefined) {
+      const found = messages.findIndex((message) => message.id === seen.messageID);
+      if (found >= 0)
+        index = found + 1;
+    }
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cost = 0;
+    let lastID = seen?.messageID;
+    let lastText;
+    for (const message of messages.slice(index)) {
+      if (message.type !== undefined && message.type !== "assistant")
+        continue;
+      inputTokens += message.tokens?.input ?? 0;
+      outputTokens += message.tokens?.output ?? 0;
+      cost += message.cost ?? 0;
+      if (message.id !== undefined)
+        lastID = message.id;
+      const text = (message.content ?? []).filter((part) => part.type === "text").map((part) => part.text ?? "").join(`
+`);
+      if (text.trim().length > 0)
+        lastText = text;
+    }
+    if (inputTokens > 0 || outputTokens > 0 || cost > 0) {
+      store.addUsage({ inputTokens, outputTokens, cost });
+    }
+    if (lastText !== undefined)
+      store.recordRoundOutput(lastText);
+    this.accounted.set(sessionID, {
+      messageID: lastID,
+      inputTokens: (seen?.inputTokens ?? 0) + inputTokens,
+      outputTokens: (seen?.outputTokens ?? 0) + outputTokens
+    });
+  }
+  async drive(store, sessionID, goal, directory) {
+    if (this.roundsInFlight.has(sessionID))
+      return;
+    const now = Date.now();
+    if (store.waitUntil > 0) {
+      if (store.waitUntil > now)
+        return;
+      store.waitUntil = 0;
+      store.waitReason = undefined;
+    }
+    const blockReason = goalBlockReason(store, goal);
+    if (blockReason !== undefined) {
+      this.blockSafely(store, goal, blockReason);
+      return;
+    }
+    const round = goal.roundsStarted + 1;
+    const text = renderGoalRoundPrompt(goal, round);
+    let admitted;
+    try {
+      admitted = store.continue({ id: goal.id, revision: goal.revision });
+    } catch (error) {
+      this.hooks.log(`goal round not admitted: ${error instanceof Error ? error.message : String(error)}`, {
+        goalID: goal.id,
+        round
+      });
+      return;
+    }
+    this.hooks.log("goal round started", { goalID: goal.id, round, revision: admitted.revision });
+    this.roundsInFlight.add(sessionID);
+    this.running.set(directory, sessionID);
+    this.hooks.session.prompt({ sessionID, text }).then(() => {}).catch((error) => {
+      this.hooks.log(`goal round errored: ${error instanceof Error ? error.message : String(error)}`, {
+        goalID: goal.id,
+        round
+      });
+      store.activation = "disarmed";
+      this.releaseRound(sessionID, directory);
+    });
+  }
+  blockSafely(store, goal, blockReason) {
+    try {
+      store.block({ id: goal.id, revision: goal.revision }, blockReason);
+      this.hooks.log(`goal blocked: ${blockReason.code}`, { goalID: goal.id });
+    } catch (error) {
+      this.hooks.log(`goal block skipped: ${error instanceof Error ? error.message : String(error)}`, { goalID: goal.id });
+    }
+  }
+  releaseRound(sessionID, directory) {
+    this.roundsInFlight.delete(sessionID);
+    if (this.running.get(directory) === sessionID)
+      this.running.delete(directory);
+  }
+}
+
+// src/state.ts
+import { randomUUID } from "crypto";
+import { mkdirSync, readFileSync, appendFileSync, existsSync } from "fs";
+import { dirname } from "path";
+
+// src/types.ts
+var EMPTY_USAGE = { inputTokens: 0, outputTokens: 0, cost: 0 };
+
+class GoalError extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "GoalError";
+    this.code = code;
+  }
+}
+
+// src/state.ts
+var GOAL_CHANGE_VERSION = 1;
+function normalizeSnapshot(snapshot) {
+  const budget = snapshot.tokenBudget;
+  if (typeof budget === "number" && Number.isFinite(budget) && budget > 0)
+    return snapshot;
+  return { ...snapshot, tokenBudget: 0 };
+}
+function sameGoal(a, b) {
+  if (a === undefined || b === undefined)
+    return a === b;
+  return a.id === b.id && a.revision === b.revision && a.phase === b.phase;
+}
+function foldGoalLog(lines) {
+  let goal;
+  let lastRef;
+  for (const line of lines) {
+    if (line.trim().length === 0)
+      continue;
+    let change;
+    try {
+      change = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (change.kind !== "goal/change" || change.version !== GOAL_CHANGE_VERSION)
+      continue;
+    if (change.operation === "clear") {
+      goal = undefined;
+      lastRef = change.cleared;
+    } else {
+      goal = normalizeSnapshot(change.goal);
+      lastRef = { id: change.goal.id, revision: change.goal.revision };
+    }
+  }
+  return { goal, lastRef };
+}
+function emptyRuntime() {
+  return {
+    activation: "disarmed",
+    waitUntil: 0,
+    waitReason: undefined,
+    recentOutputs: []
+  };
+}
+
+class GoalStore {
+  logPath;
+  state;
+  runtime;
+  seq = 0;
+  bornWith;
+  constructor(worktree) {
+    this.logPath = `${worktree}/.opencode/goal-log.jsonl`;
+    this.runtime = emptyRuntime();
+    this.state = { goal: undefined, lastRef: undefined };
+    if (existsSync(this.logPath)) {
+      const lines = readFileSync(this.logPath, "utf8").split(`
+`);
+      this.state = foldGoalLog(lines);
+      this.seq = lines.filter((l) => l.trim().length > 0).length;
+    }
+    const born = this.state.goal;
+    this.bornWith = born === undefined ? undefined : { id: born.id, revision: born.revision };
+    this.applyActivation(born);
+  }
+  applyActivation(goal) {
+    const mutatedWhileAlive = goal !== undefined && (this.bornWith === undefined || goal.id !== this.bornWith.id || goal.revision > this.bornWith.revision);
+    this.runtime.activation = goal !== undefined && goal.phase === "active" && mutatedWhileAlive ? "armed" : "disarmed";
+  }
+  sync() {
+    if (!existsSync(this.logPath)) {
+      const previous2 = this.state.goal;
+      if (previous2 === undefined)
+        return;
+      this.state = { goal: undefined, lastRef: this.state.lastRef };
+      this.applyExternalChange(previous2, undefined);
+      return;
+    }
+    let lines;
+    try {
+      lines = readFileSync(this.logPath, "utf8").split(`
+`);
+    } catch {
+      return;
+    }
+    const folded = foldGoalLog(lines);
+    const previous = this.state.goal;
+    if (sameGoal(previous, folded.goal))
+      return;
+    this.state = folded;
+    this.applyExternalChange(previous, folded.goal);
+  }
+  applyExternalChange(previous, next) {
+    if (next === undefined) {
+      this.runtime.activation = "disarmed";
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+      this.runtime.recentOutputs.length = 0;
+      this.usageOverlay = undefined;
+      return;
+    }
+    const replaced = previous === undefined || previous.id !== next.id;
+    if (replaced || next.phase !== previous?.phase) {
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+      this.runtime.recentOutputs.length = 0;
+    }
+    if (replaced)
+      this.usageOverlay = undefined;
+    this.applyActivation(next);
+  }
+  get current() {
+    return this.state.goal;
+  }
+  get activation() {
+    return this.runtime.activation;
+  }
+  set activation(value) {
+    this.runtime.activation = value;
+  }
+  get tokenBudget() {
+    return this.view()?.tokenBudget ?? 0;
+  }
+  get waitUntil() {
+    return this.runtime.waitUntil;
+  }
+  set waitUntil(value) {
+    this.runtime.waitUntil = value;
+  }
+  get waitReason() {
+    return this.runtime.waitReason;
+  }
+  set waitReason(value) {
+    this.runtime.waitReason = value;
+  }
+  view() {
+    this.sync();
+    const goal = this.state.goal;
+    if (goal === undefined)
+      return;
+    return {
+      ...goal,
+      usage: this.effectiveUsage(goal),
+      activation: this.runtime.activation,
+      waitUntil: this.runtime.waitUntil,
+      waitReason: this.runtime.waitReason
+    };
+  }
+  static normalizeOutput(text) {
+    return text.normalize("NFKC").toLowerCase().replace(/[\u0000-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
+  }
+  recordRoundOutput(output) {
+    const normalized = GoalStore.normalizeOutput(output);
+    const recent = this.runtime.recentOutputs;
+    if (normalized.length === 0) {
+      if (recent.length > 0 && recent[recent.length - 1] === "") {
+        recent.push("");
+      } else {
+        recent.length = 0;
+        recent.push("");
+      }
+    } else if (recent.length > 0 && recent[recent.length - 1] === normalized) {
+      recent.push(normalized);
+    } else {
+      recent.length = 0;
+      recent.push(normalized);
+    }
+    if (recent.length > 3)
+      recent.splice(0, recent.length - 3);
+    return recent.length >= 3;
+  }
+  hasRepeatedRounds() {
+    return this.runtime.recentOutputs.length >= 3;
+  }
+  resetNoProgress() {
+    this.runtime.recentOutputs.length = 0;
+  }
+  addUsage(usage) {
+    const goal = this.state.goal;
+    if (goal === undefined)
+      return;
+    const current = goal.usage;
+    const next = {
+      inputTokens: current.inputTokens + (usage.inputTokens ?? 0),
+      outputTokens: current.outputTokens + (usage.outputTokens ?? 0),
+      cost: current.cost + (usage.cost ?? 0)
+    };
+    this.usageOverlay = next;
+  }
+  usageOverlay;
+  effectiveUsage(goal) {
+    return this.usageOverlay ?? goal.usage;
+  }
+  expectCurrent(ref) {
+    this.sync();
+    const current = this.state.goal;
+    if (current === undefined)
+      throw new GoalError("GOAL_NOT_FOUND", "no current goal");
+    if (ref.id !== current.id || ref.revision !== current.revision) {
+      throw new GoalError("GOAL_STALE_REVISION", `stale goal ref "${ref.id}" revision ${ref.revision}; current is "${current.id}" revision ${current.revision}`);
+    }
+    return current;
+  }
+  commit(change) {
+    mkdirSync(dirname(this.logPath), { recursive: true });
+    appendFileSync(this.logPath, `${JSON.stringify(change)}
+`);
+    this.seq += 1;
+    if (change.operation === "clear") {
+      this.state = { goal: undefined, lastRef: change.cleared };
+    } else {
+      this.state = { goal: change.goal, lastRef: { id: change.goal.id, revision: change.goal.revision } };
+    }
+    this.usageOverlay = undefined;
+  }
+  snapshotWithUsage(base, usage) {
+    return { ...base, usage: usage ?? EMPTY_USAGE };
+  }
+  nextTime(goal) {
+    return Math.max(Date.now(), goal.updatedAt);
+  }
+  static resolveTokenBudget(value) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new GoalError("GOAL_INVALID_TOKEN_BUDGET", "tokenBudget must be a non-negative safe integer (0 = unlimited)");
+    }
+    return value;
+  }
+  static resolveMaxGoalRounds(value) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new GoalError("GOAL_INVALID_MAX_ROUNDS", "maxGoalRounds must be a positive safe integer");
+    }
+    return value;
+  }
+  static resolveObjective(value) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new GoalError("GOAL_INVALID_OBJECTIVE", "goal objective must be a non-empty string");
+    }
+    return value.trim();
+  }
+  static resolveBlockReason(reason) {
+    const code = reason.code;
+    const message = reason.message;
+    if (typeof code !== "string" || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(code) || typeof message !== "string" || message.trim().length === 0) {
+      throw new GoalError("GOAL_INVALID_BLOCK_REASON", "block reason requires a lower-kebab-case code and a non-empty message");
+    }
+    return { code, message: message.trim() };
+  }
+  create(objective, maxGoalRounds, tokenBudget) {
+    const resolvedObjective = GoalStore.resolveObjective(objective);
+    const resolvedRounds = GoalStore.resolveMaxGoalRounds(maxGoalRounds);
+    const resolvedBudget = GoalStore.resolveTokenBudget(tokenBudget);
+    this.sync();
+    const current = this.state.goal;
+    if (current !== undefined && current.phase !== "complete") {
+      throw new GoalError("GOAL_ALREADY_EXISTS", `goal "${current.id}" already exists with phase "${current.phase}"`);
+    }
+    const now = Date.now();
+    const goal = this.snapshotWithUsage({
+      id: `goal-${randomUUID()}`,
+      revision: 1,
+      objective: resolvedObjective,
+      phase: "active",
+      maxGoalRounds: resolvedRounds,
+      tokenBudget: resolvedBudget,
+      createdAt: now,
+      updatedAt: now,
+      roundsStarted: 0
+    }, this.usageOverlay);
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "create",
+      goal
+    });
+    this.runtime.activation = "armed";
+    this.runtime.waitUntil = 0;
+    this.runtime.waitReason = undefined;
+    this.resetNoProgress();
+    return this.view();
+  }
+  edit(ref, objective, maxGoalRounds) {
+    const current = this.expectCurrent(ref);
+    if (objective === undefined && maxGoalRounds === undefined) {
+      throw new GoalError("GOAL_INVALID_EDIT", "goal edit requires objective and/or maxGoalRounds");
+    }
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      objective: objective === undefined ? current.objective : GoalStore.resolveObjective(objective),
+      maxGoalRounds: maxGoalRounds === undefined ? current.maxGoalRounds : GoalStore.resolveMaxGoalRounds(maxGoalRounds),
+      updatedAt: this.nextTime(current)
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "edit",
+      goal
+    });
+    this.resetNoProgress();
+    return this.view();
+  }
+  transition(ref, operation, allowed, phase, activation, blockedReason) {
+    const current = this.expectCurrent(ref);
+    if (!allowed.includes(current.phase)) {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `cannot ${operation} goal "${current.id}" from phase "${current.phase}"; expected ${allowed.join(" or ")}`);
+    }
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      phase,
+      updatedAt: this.nextTime(current),
+      ...blockedReason === undefined ? {} : { blockedReason: GoalStore.resolveBlockReason(blockedReason) }
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation,
+      goal
+    });
+    this.runtime.activation = activation;
+    if (operation === "resume") {
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+      this.resetNoProgress();
+    }
+    if (operation === "block" || operation === "complete") {
+      this.runtime.waitUntil = 0;
+      this.runtime.waitReason = undefined;
+    }
+    return this.view();
+  }
+  pause(ref) {
+    return this.transition(ref, "pause", ["active"], "paused", "disarmed");
+  }
+  resume(ref) {
+    const current = this.expectCurrent(ref);
+    if (current.phase === "active" && this.runtime.activation === "armed") {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `goal "${current.id}" is already active and armed`);
+    }
+    if (current.roundsStarted >= current.maxGoalRounds) {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `goal "${current.id}" exhausted ${current.maxGoalRounds} goal rounds; increase maxGoalRounds before resuming`);
+    }
+    return this.transition(ref, "resume", ["active", "paused", "blocked"], "active", "armed");
+  }
+  complete(ref) {
+    return this.transition(ref, "complete", ["active", "paused", "blocked"], "complete", "disarmed");
+  }
+  block(ref, reason) {
+    return this.transition(ref, "block", ["active"], "blocked", "disarmed", reason);
+  }
+  continue(ref) {
+    const current = this.expectCurrent(ref);
+    if (current.phase !== "active") {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `cannot continue goal "${current.id}" from phase "${current.phase}"`);
+    }
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      roundsStarted: current.roundsStarted + 1,
+      updatedAt: this.nextTime(current)
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "continue",
+      goal
+    });
+    return this.view();
+  }
+  wait(ref, reason, resumeAfterMs) {
+    const current = this.expectCurrent(ref);
+    if (current.phase !== "active") {
+      throw new GoalError("GOAL_INVALID_TRANSITION", `cannot wait on goal "${current.id}" from phase "${current.phase}"`);
+    }
+    if (typeof reason !== "string" || reason.trim().length === 0 || reason.length > 1000) {
+      throw new GoalError("GOAL_INVALID_EDIT", "wait reason must be 1-1000 characters");
+    }
+    const now = Date.now();
+    const clamped = resumeAfterMs === undefined ? undefined : Math.max(resumeAfterMs, 1e4);
+    const goal = this.snapshotWithUsage({
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: this.nextTime(current)
+    }, this.effectiveUsage(current));
+    this.commit({
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "wait",
+      goal
+    });
+    this.runtime.waitReason = reason.trim();
+    this.runtime.waitUntil = clamped === undefined ? 0 : now + clamped;
+    return this.view();
+  }
+  clear(ref) {
+    const current = this.expectCurrent(ref);
+    const tombstone = { id: current.id, revision: current.revision + 1 };
+    const change = {
+      kind: "goal/change",
+      version: GOAL_CHANGE_VERSION,
+      operation: "clear",
+      cleared: tombstone,
+      clearedAt: Date.now()
+    };
+    this.commit(change);
+    this.runtime.activation = "disarmed";
+    this.runtime.waitUntil = 0;
+    this.runtime.waitReason = undefined;
+    this.resetNoProgress();
+  }
+}
+
+// src/tools.ts
+function goalRef(goalID, revision) {
+  if (goalID.length === 0 || goalID !== goalID.trim() || !Number.isSafeInteger(revision) || revision < 1) {
+    throw new GoalError("GOAL_INVALID_EDIT", "goal_id must be non-empty and revision must be a positive safe integer");
+  }
+  return { id: goalID, revision };
+}
+function goalValue(goal) {
+  if (goal === undefined)
+    return { goal: null };
+  return {
+    goal: {
+      id: goal.id,
+      revision: goal.revision,
+      objective: goal.objective,
+      phase: goal.phase,
+      roundsStarted: goal.roundsStarted,
+      maxGoalRounds: goal.maxGoalRounds,
+      tokenBudget: goal.tokenBudget,
+      usage: goal.usage,
+      ...goal.blockedReason === undefined ? {} : { blockedReason: goal.blockedReason }
+    },
+    activation: goal.activation,
+    waitUntil: goal.waitUntil,
+    waitReason: goal.waitReason
+  };
+}
+var DIRECT_TOOL_OPTIONS = { codemode: false };
+function requireString(args, field) {
+  const value = args[field];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new GoalError("GOAL_INVALID_EDIT", `${field} must be a non-empty string`);
+  }
+  return value;
+}
+function optionalString(args, field) {
+  const value = args[field];
+  if (value === undefined || value === null)
+    return;
+  if (typeof value !== "string") {
+    throw new GoalError("GOAL_INVALID_EDIT", `${field} must be a string when present`);
+  }
+  return value;
+}
+function requirePositiveInteger(args, field) {
+  const value = args[field];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new GoalError("GOAL_INVALID_EDIT", `${field} must be a positive safe integer`);
+  }
+  return value;
+}
+function optionalNumber(args, field) {
+  const value = args[field];
+  if (value === undefined || value === null)
+    return;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new GoalError("GOAL_INVALID_EDIT", `${field} must be a non-negative number when present`);
+  }
+  return value;
+}
+var UPDATE_ACTIONS = ["complete", "blocked", "pause", "resume", "edit"];
+function goalTools(root, getStore) {
+  const store = () => getStore(root);
+  return [
+    {
+      name: "get_goal",
+      description: "Read the current goal of this project, including its exact id/revision, objective, phase, rounds, round limit, token budget, usage, and whether a continuation is armed. Call this before update_goal.",
+      options: DIRECT_TOOL_OPTIONS,
+      input: {
+        type: "object",
+        properties: {},
+        additionalProperties: false
+      },
+      async execute() {
+        return { content: JSON.stringify(goalValue(store().view())) };
+      }
+    },
+    {
+      name: "create_goal",
+      description: "Create one persisted completion goal for the current project when the current task is a long-running objective that should continue across autonomous rounds. Replaces a completed goal; a non-complete goal must be cleared first. Starts autonomous continuation (rounds, guarded by the round cap).",
+      options: DIRECT_TOOL_OPTIONS,
+      input: {
+        type: "object",
+        properties: {
+          objective: { type: "string", description: "The concrete completion objective." },
+          max_goal_rounds: {
+            type: "integer",
+            description: "Optional positive integer limit on automatic continuation rounds (default 25)."
+          },
+          token_budget: {
+            type: "number",
+            description: "Optional total token budget; continuation stops when provider-reported usage reaches it (0 = unlimited)."
+          }
+        },
+        required: ["objective"],
+        additionalProperties: false
+      },
+      async execute(rawArgs) {
+        const args = rawArgs ?? {};
+        const view = store().create(requireString(args, "objective"), optionalNumber(args, "max_goal_rounds") ?? 25, optionalNumber(args, "token_budget") ?? 0);
+        return { content: JSON.stringify(goalValue(view)) };
+      }
+    },
+    {
+      name: "update_goal",
+      description: "Update the exact current goal revision. Actions: complete (mark achieved with evidence), blocked (report a true impasse), pause, resume, edit (objective and/or max_goal_rounds). Requires the exact goal_id and revision returned by get_goal; stale refs are rejected.",
+      options: DIRECT_TOOL_OPTIONS,
+      input: {
+        type: "object",
+        properties: {
+          goal_id: { type: "string", description: "Exact id returned by get_goal." },
+          revision: { type: "integer", description: "Exact positive revision returned by get_goal." },
+          action: {
+            type: "string",
+            enum: [...UPDATE_ACTIONS],
+            description: "The operation to perform."
+          },
+          objective: { type: "string", description: "Replacement objective; valid only with action edit." },
+          max_goal_rounds: { type: "integer", description: "Replacement round cap; valid only with action edit." },
+          summary: {
+            type: "string",
+            description: "Completion evidence summary; required with action complete."
+          },
+          blocked_reason: {
+            type: "string",
+            description: "Concrete blocking condition; required with action blocked."
+          }
+        },
+        required: ["goal_id", "revision", "action"],
+        additionalProperties: false
+      },
+      async execute(rawArgs) {
+        const args = rawArgs ?? {};
+        const ref = goalRef(requireString(args, "goal_id"), requirePositiveInteger(args, "revision"));
+        const action = requireString(args, "action");
+        if (!UPDATE_ACTIONS.includes(action)) {
+          throw new GoalError("GOAL_INVALID_EDIT", `unknown action ${action}`);
+        }
+        switch (action) {
+          case "edit": {
+            const objective = optionalString(args, "objective");
+            const maxGoalRounds = optionalNumber(args, "max_goal_rounds");
+            if (objective === undefined && maxGoalRounds === undefined) {
+              throw new GoalError("GOAL_INVALID_EDIT", "edit requires objective and/or max_goal_rounds");
+            }
+            return {
+              content: JSON.stringify(goalValue(store().edit(ref, objective, maxGoalRounds)))
+            };
+          }
+          case "pause":
+            return { content: JSON.stringify(goalValue(store().pause(ref))) };
+          case "resume":
+            return { content: JSON.stringify(goalValue(store().resume(ref))) };
+          case "complete": {
+            const summary = optionalString(args, "summary");
+            if (summary === undefined || summary.trim().length === 0) {
+              throw new GoalError("GOAL_INVALID_EDIT", "complete requires a summary of completion evidence");
+            }
+            if (summary.toLowerCase().includes("not complete") || summary.toLowerCase().includes("still fail")) {
+              throw new GoalError("GOAL_INVALID_EDIT", "completion summary contradicts completion");
+            }
+            return { content: JSON.stringify(goalValue(store().complete(ref))) };
+          }
+          case "blocked": {
+            const blockedReason = optionalString(args, "blocked_reason");
+            if (blockedReason === undefined || blockedReason.trim().length === 0) {
+              throw new GoalError("GOAL_INVALID_EDIT", "blocked requires a concrete blocked_reason");
+            }
+            return {
+              content: JSON.stringify(goalValue(store().block(ref, { code: "model-reported", message: blockedReason.trim() })))
+            };
+          }
+          default:
+            throw new GoalError("GOAL_INVALID_EDIT", `unknown action ${action}`);
+        }
+      }
+    },
+    {
+      name: "goal_wait",
+      description: "Wait for an external event (e.g. a monitor, review, or CI run). Suppresses automatic continuation until the optional deadline (resume_after_ms) or until other non-goal work arrives. Use only after arranging an external wake source.",
+      options: DIRECT_TOOL_OPTIONS,
+      input: {
+        type: "object",
+        properties: {
+          goal_id: { type: "string", description: "Exact id returned by get_goal." },
+          revision: { type: "integer", description: "Exact positive revision returned by get_goal." },
+          reason: { type: "string", description: "Why the goal is waiting (1-1000 chars)." },
+          resume_after_ms: {
+            type: "number",
+            description: "Optional safety wake-up deadline in ms (clamped to at least 10s)."
+          }
+        },
+        required: ["goal_id", "revision", "reason"],
+        additionalProperties: false
+      },
+      async execute(rawArgs) {
+        const args = rawArgs ?? {};
+        const ref = goalRef(requireString(args, "goal_id"), requirePositiveInteger(args, "revision"));
+        return {
+          content: JSON.stringify(goalValue(store().wait(ref, requireString(args, "reason"), optionalNumber(args, "resume_after_ms"))))
+        };
+      }
+    }
+  ];
+}
+
+// src/index.ts
+var OpenCodeGoalPlugin = {
+  id: "opencode-goal",
+  async setup(ctx) {
+    const root = ctx.location.directory;
+    const stores = new Map;
+    const getStore = (dir) => {
+      const key = dir.length > 0 ? dir : root;
+      let store = stores.get(key);
+      if (store === undefined) {
+        store = new GoalStore(key);
+        stores.set(key, store);
+      }
+      return store;
+    };
+    const log = (message, extra) => {
+      console.log(`[opencode-goal] ${message}`, extra ?? "");
+    };
+    const sessionDirectories = new Map;
+    const childSessions = new Set;
+    const normalizePath = (value) => value.replace(/\//g, "\\").toLowerCase();
+    const ownsDirectory = (directory) => {
+      const rootPath = normalizePath(root);
+      const dir = normalizePath(directory);
+      return dir === rootPath || dir.startsWith(`${rootPath}\\`);
+    };
+    const rememberSession = (sessionID, directory, parentID) => {
+      if (directory !== undefined && directory.length > 0)
+        sessionDirectories.set(sessionID, directory);
+      if (typeof parentID === "string" && parentID.length > 0)
+        childSessions.add(sessionID);
+    };
+    const resolveTurnSession = async (sessionID, envelopeDirectory) => {
+      if (childSessions.has(sessionID))
+        return;
+      let directory = sessionDirectories.get(sessionID);
+      if (directory === undefined) {
+        try {
+          const info = await ctx.session.get({ sessionID });
+          if (info === undefined)
+            return;
+          const infoDirectory = info.directory ?? info.location?.directory;
+          rememberSession(sessionID, infoDirectory, info.parentID);
+          if (childSessions.has(sessionID))
+            return;
+          directory = infoDirectory;
+        } catch {
+          return;
+        }
+      }
+      if (directory === undefined || directory.length === 0)
+        directory = envelopeDirectory;
+      if (directory === undefined || !ownsDirectory(directory))
+        return;
+      return directory;
+    };
+    const driver = new GoalDriver({
+      getStore,
+      session: ctx.session,
+      log
+    });
+    driver.setDirectory(root);
+    getStore(root);
+    log("plugin initialized", { root });
+    const tools = goalTools(root, getStore);
+    const toolRegistration = await ctx.tool.transform((editor) => {
+      for (const tool of tools)
+        editor.add(tool);
+    });
+    const systemHook = await ctx.session.hook("context", (event) => {
+      const goal = getStore(root).view();
+      if (goal === undefined || goal.phase !== "active")
+        return;
+      const budget = goal.tokenBudget > 0 ? ` | budget ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}` : "";
+      event.system.push({
+        type: "text",
+        text: [
+          `[opencode-goal] Active goal (round ${goal.roundsStarted + 1}/${goal.maxGoalRounds}${budget}): ${goal.objective}`,
+          'Keep working toward this objective across turns. Call get_goal to inspect it, update_goal(action="complete") with evidence when achieved, update_goal(action="blocked") for a true impasse, or goal_wait while waiting on external events.'
+        ].join(`
+`)
+      });
+    });
+    const controller = new AbortController;
+    (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event.type === "session.idle") {
+            const sessionID = event.data.sessionID;
+            if (sessionID === undefined)
+              continue;
+            (async () => {
+              const directory = await resolveTurnSession(sessionID, event.location?.directory);
+              if (directory !== undefined)
+                await driver.onSessionIdle(sessionID, directory);
+            })();
+          } else if (event.type === "session.created") {
+            const entries = Array.isArray(event.data) ? event.data : [event.data];
+            for (const entry of entries) {
+              const sessionID = entry.sessionID ?? entry.info?.id;
+              if (sessionID === undefined)
+                continue;
+              const parentID = entry.parentID ?? entry.info?.parentID;
+              const directory = entry.location?.directory ?? entry.info?.directory ?? event.location?.directory ?? root;
+              rememberSession(sessionID, directory, parentID);
+              if (childSessions.has(sessionID))
+                continue;
+              if (!ownsDirectory(directory))
+                continue;
+              driver.onSessionCreated(sessionID, directory);
+            }
+          } else if (event.type === "session.execution.succeeded" || event.type === "session.execution.failed" || event.type === "session.execution.interrupted") {
+            const sessionID = event.data.sessionID;
+            if (sessionID === undefined)
+              continue;
+            const reason = event.type === "session.execution.interrupted" ? event.data.reason : undefined;
+            (async () => {
+              const directory = await resolveTurnSession(sessionID, event.location?.directory);
+              if (directory !== undefined)
+                await driver.onTurnFinished(sessionID, directory, reason);
+            })();
+          } else if (event.type === "session.deleted") {
+            const sessionID = event.data.sessionID;
+            if (sessionID === undefined)
+              continue;
+            sessionDirectories.delete(sessionID);
+            childSessions.delete(sessionID);
+            driver.forget(sessionID);
+          }
+        }
+      } catch {}
+    })();
+    return async () => {
+      controller.abort();
+      await systemHook.dispose();
+      await toolRegistration.dispose();
+    };
+  }
+};
+var src_default = OpenCodeGoalPlugin;
+export {
+  src_default as default,
+  OpenCodeGoalPlugin
+};
