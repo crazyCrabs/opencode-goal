@@ -28,6 +28,18 @@ project's `.opencode/plugins/`):
 A plugin directory is auto-discovered: the server half resolves to `index` and
 the TUI half to `tui`, so no `tui.json` registration is needed.
 
+## Hooks
+
+`.githooks/pre-commit` is versioned, but git will not use it until the path is
+pointed at it, once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+It typechecks only. `bun run check` runs typecheck and the suite, and is what CI
+runs.
+
 The TUI bundle keeps `solid-js` and `@opentui/*` external, so those packages
 must resolve from the config directory (opencode installs them itself; verify
 with `ls ~/.config/opencode/node_modules/solid-js`).
