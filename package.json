@@ -21,7 +21,9 @@
     "build:server": "bun build ./src/index.ts --outdir dist --target bun",
     "build:tui": "bun build ./src/tui.tsx --outdir dist --target bun --external solid-js --external '@opentui/*'",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "check": "bun run typecheck && bun run test",
+    "check:fast": "bun run typecheck"
   },
   "keywords": ["opencode", "plugin", "goal", "autonomous", "agent"],
   "license": "MIT",

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Typecheck only. The full suite is ~80s, which is too slow to put between a
+# developer and their commit; CI runs `bun run check` for that.
+#
+# `--no-verify` skips this, and that is the point of a hook rather than a gate:
+# it catches the failure mode that cost the most this rework — a scripted edit
+# leaving a file syntactically broken — without ever blocking a commit that is
+# already known-good.
+set -e
+echo "pre-commit: typecheck"
+bun run check:fast

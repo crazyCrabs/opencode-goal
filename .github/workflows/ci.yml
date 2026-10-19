@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    # windows-latest matches the platform this is developed on. The suite itself
+    # is portable — it builds every path from `tmpdir()` and `node:path` — but a
+    # matrix entry that cannot be run here would be a red build nobody can act
+    # on, so Linux coverage is a deliberate follow-up rather than an untested bet.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run check
