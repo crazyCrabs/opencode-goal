@@ -315,21 +315,27 @@ describe('tui goal command plane', () => {
 
   test('a goal created from the home route is continued by another instance', async () => {
     // the TUI half that created the goal without a session. It now makes one and
-    // runs round 1 there, so the second half's resume is round 2 rather than
-    // round 1 — the same cross-instance continuation, one round further on.
+    // runs round 1 there.
     const created = setup({ type: 'home' })
     await created.command('goal.command').run!('work started later')
     expect(created.prompts.length).toBe(1)
+    const room = created.created[0]
+    expect(room).toBeDefined()
 
-    // a second TUI half, with a session open: `/goal resume` admits the next round
-    const resumed = setup()
+    // a second TUI half, in the SAME session: `/goal resume` admits the next round.
+    // The room is shared, not the directory — a goal belongs to its session, so a
+    // second instance continues it by being in the session it works in, which is
+    // the cross-instance continuation this test has always been about. A second
+    // instance in a *different* session of the same worktree correctly sees no
+    // goal at all.
+    const resumed = setup({ type: 'session', sessionID: room })
     resumed.context.location!.directory = created.directory
     await resumed.command('goal.command').run!('resume')
 
     expect(resumed.prompts.length).toBe(1)
-    expect(resumed.prompts[0].sessionID).toBe('ses-goal')
+    expect(resumed.prompts[0].sessionID).toBe(room)
     expect(resumed.prompts[0].text).toContain('round 2/25')
-    expect(new GoalStore(created.directory).current?.roundsStarted).toBe(2)
+    expect(new GoalStore(created.directory, room).current?.roundsStarted).toBe(2)
   })
 
   test('a paused goal is resumed and started by /goal resume', async () => {
@@ -580,7 +586,10 @@ describe('the home route: a goal starts without the human sending a message', ()
       // it and reads as disarmed — which is correct, and is why the auto-start
       // has to arm before it kicks
       const writer = new GoalStore(harness.directory)
-      writer.create('auto objective', 25, 0)
+      // a goal written by another writer, in the session the human will open:
+      // a goal belongs to its session, so "another writer" means another
+      // process, not another session
+      new GoalStore(harness.directory, 'ses-auto').create('auto objective', 25, 0)
 
       await ticks()
       expect(harness.prompts.length).toBe(0) // no session yet: nothing to run in
@@ -1152,7 +1161,7 @@ describe('the auto-start does not follow the human into another session', () => 
     // ticket 26's case, and opening a session is the human's go-ahead.
     const harness = polling({ type: 'home' })
     try {
-      new GoalStore(harness.directory).create('auto objective', 25, 0)
+      new GoalStore(harness.directory, 'ses-auto').create('auto objective', 25, 0)
       await ticks()
       expect(harness.prompts.length).toBe(0)
 
@@ -1192,6 +1201,94 @@ describe('the auto-start does not follow the human into another session', () => 
       // still exactly one round, in the goal's own room: the wander cost nothing
       expect(harness.prompts.length).toBe(1)
       expect(harness.prompts[0].sessionID).toBe('ses-room')
+    } finally {
+      // handled by cleanups
+    }
+  })
+})
+
+describe('a goal belongs to its session, not to the directory', () => {
+  /**
+   * The human's requirement, verbatim:
+   *
+   *   在同一个工作目录下，所有的 goal 都是共享的，新开的 session 对话也会把旧 session
+   *   中的 goal 任务拿来读取。我所期望的是就算是在同一工作目录下，也需要根据 session
+   *   对话来区分 goal 任务，颗粒度要到 session 而不是目录。
+   *
+   * One goal log per worktree means every session in that worktree shares one goal:
+   * opening a new session inherits the old one's objective, its rounds and its
+   * budget. The scope has to be the session.
+   */
+  test('a new session in the same directory has no goal of its own', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-a' })
+    try {
+      await harness.command('goal.command').run!('objective belonging to A')
+      await ticks()
+      expect(harness.prompts.length).toBe(1)
+
+      // the human opens a different session in the same worktree
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-b',
+      })
+      await ticks()
+
+      // and it has no goal: not A's objective, not A's rounds
+      await harness.command('goal.command').run!('status')
+      const last = harness.toasts[harness.toasts.length - 1]
+      expect(last.message).toContain('No goal is currently set')
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('each session drives its own goal, independently', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-a' })
+    try {
+      await harness.command('goal.command').run!('A objective')
+      await ticks()
+      expect(harness.prompts.length).toBe(1)
+      expect(harness.prompts[0].sessionID).toBe('ses-a')
+
+      // B gets its own goal, and its rounds run in B
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-b',
+      })
+      await harness.command('goal.command').run!('B objective')
+      await ticks()
+
+      expect(harness.prompts.length).toBe(2)
+      expect(harness.prompts[1].sessionID).toBe('ses-b')
+      expect(harness.prompts[1].text).toContain('round 1/25')
+      expect(harness.prompts[1].text).toContain('B objective')
+    } finally {
+      // handled by cleanups
+    }
+  })
+
+  test('going back to the first session finds its goal again', async () => {
+    const harness = polling({ type: 'session', sessionID: 'ses-a' })
+    try {
+      await harness.command('goal.command').run!('A objective')
+      await ticks()
+
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-b',
+      })
+      await harness.command('goal.command').run!('B objective')
+      await ticks()
+
+      // back in A, A's goal is still there and B's is not
+      ;(harness.context.ui as unknown as { setRoute: (r: TuiRouteRef) => void }).setRoute({
+        type: 'session',
+        sessionID: 'ses-a',
+      })
+      await harness.command('goal.command').run!('status')
+      const last = harness.toasts[harness.toasts.length - 1]
+      expect(last.message).toContain('A objective')
+      expect(last.message).not.toContain('B objective')
     } finally {
       // handled by cleanups
     }

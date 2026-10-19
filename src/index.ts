@@ -63,14 +63,33 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
   async setup(ctx) {
     const root = ctx.location.directory
 
-    /** One event-sourced store per project root. */
+    /**
+     * One event-sourced store per session.
+     *
+     * A goal belongs to the session it was created in, so the store is keyed by
+     * session rather than by project root. Two sessions in one worktree therefore
+     * hold two goals, and a turn completing in one of them says nothing about the
+     * other's goal — which is the whole scope change, and the reason the
+     * cross-session defect cannot recur: there is no shared goal left to drive.
+     */
     const stores = new Map<string, GoalStore>()
-    const getStore = (dir: string): GoalStore => {
+    const getStore = (dir: string, sessionID?: string): GoalStore => {
       const key = dir.length > 0 ? dir : root
-      let store = stores.get(key)
+      if (sessionID === undefined || sessionID.length === 0) {
+        // no session in hand: the directory-scoped view, which is what a
+        // lifecycle hook outside a turn gets
+        let shared = stores.get(key)
+        if (shared === undefined) {
+          shared = new GoalStore(key)
+          stores.set(key, shared)
+        }
+        return shared
+      }
+      const scoped = `${key}\u0000${goalSessionOf(sessionID)}`
+      let store = stores.get(scoped)
       if (store === undefined) {
-        store = new GoalStore(key)
-        stores.set(key, store)
+        store = new GoalStore(key, sessionID)
+        stores.set(scoped, store)
       }
       return store
     }
@@ -87,6 +106,16 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     const sessionDirectories = new Map<string, string>()
     /** Subagent/child sessions (they carry a parentID) never run goal rounds. */
     const childSessions = new Set<string>()
+    /**
+     * Each child session's parent, so a subagent's work is charged to the goal it
+     * was spawned for.
+     *
+     * A goal belongs to its session, so a subagent session has no goal of its own —
+     * but the commands it runs are the goal's work, and the completion claim is
+     * cross-checked against them. Without this map a command run by a subagent
+     * would be invisible to the goal that asked for it.
+     */
+    const sessionParents = new Map<string, string>()
 
     /** Normalize a path for comparison: Windows accepts both separators. */
     const normalizePath = (value: string): string => value.replace(/\//g, '\\').toLowerCase()
@@ -121,8 +150,19 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
      */
     const rememberSession = (sessionID: string, directory: string | undefined, parentID: unknown): void => {
       if (directory !== undefined && directory.length > 0) sessionDirectories.set(sessionID, directory)
-      if (typeof parentID === 'string' && parentID.length > 0) childSessions.add(sessionID)
+      if (typeof parentID === 'string' && parentID.length > 0) {
+        childSessions.add(sessionID)
+        sessionParents.set(sessionID, parentID)
+      }
     }
+
+    /**
+     * The session whose goal a session's work belongs to.
+     *
+     * A subagent's own session holds no goal, so its events are attributed to the
+     * session that spawned it — which is the one whose goal the work serves.
+     */
+    const goalSessionOf = (sessionID: string): string => sessionParents.get(sessionID) ?? sessionID
 
     /**
      * Resolve the directory a session's turn belongs to, or undefined when it
@@ -186,7 +226,7 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
     // one that submitted the prompt that started the turn.
     //
     const accounting = new GoalAccounting({
-      storeFor: getStore,
+      storeFor: (directory: string, sessionID?: string) => getStore(directory, sessionID),
       isGoalTurn: sessionID => driver.isGoalTurn(sessionID),
     })
 
@@ -204,11 +244,13 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
       for (const tool of tools) editor.add(tool)
     })
 
-    // System-prompt injection: surface the active goal to every model turn. The
-    // plugin is loaded once per location, so its sessions share this directory
-    // and therefore this one goal log.
+    // System-prompt injection: surface the active goal to every model turn.
+    // The plugin is loaded once per location, but a goal belongs to its session, so
+    // the goal injected into a turn is the goal of the session that turn runs in —
+    // not whatever goal the directory happens to hold. A turn in a session with no
+    // goal of its own gets no goal block at all, which is the point.
     const systemHook = await ctx.session.hook('context', (event) => {
-      const goal = getStore(root).view()
+      const goal = getStore(root, event.sessionID).view()
       if (goal === undefined || goal.phase !== 'active') return
       const budget = goal.tokenBudget > 0
         ? ` | budget ${goal.usage.inputTokens + goal.usage.outputTokens}/${goal.tokenBudget}`
@@ -396,7 +438,7 @@ export const OpenCodeGoalPlugin: Plugin.Plugin = {
             void (async () => {
               const directory = await resolveTurnSession(sessionID, event.location?.directory)
               if (directory === undefined) return
-              const store = getStore(directory)
+              const store = getStore(directory, sessionID)
               const goal = store.view()
               if (goal === undefined || goal.waitUntil === 0) return
               // Arming here is what lets the arriving turn drive the next round:

@@ -141,7 +141,57 @@ export interface GoalFoldState {
  * adopts a snapshot's carried value is what keeps old and new logs both folding
  * correctly; see the comment on the seeding below.
  */
-export function foldGoalLog(lines: readonly string[]): GoalFoldState {
+/**
+ * The session a log line belongs to, or undefined when it belongs to none.
+ *
+ * Lines written before the goal became session-scoped carry no session, and the
+ * fold has to tell them apart from another session's lines: one is a goal this
+ * session may adopt, the other is a goal it must never see.
+ */
+function lineSession(line: GoalLogLine): string | undefined {
+  const value = (line as { session?: unknown }).session
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+/**
+ * The session the directory-scoped goal last worked in, or undefined when the log
+ * holds no unscoped goal at all.
+ *
+ * A pre-pass rather than something the fold discovers as it goes, because the
+ * decision has to be made before the first line is folded: whether this session
+ * inherits the legacy lines is not something a later line may revise.
+ */
+function legacyRoom(lines: readonly string[]): string | undefined {
+  let room: string | undefined
+  for (const line of lines) {
+    if (line.trim().length === 0) continue
+    let parsed: GoalLogLine
+    try {
+      parsed = JSON.parse(line) as GoalLogLine
+    } catch {
+      continue // tolerate a torn tail write
+    }
+    if (lineSession(parsed) !== undefined) continue // a scoped line says nothing about the legacy goal
+    if (parsed.kind === 'goal/session') room = parsed.sessionID
+  }
+  return room
+}
+
+/**
+ * Fold the log, optionally scoped to one session.
+ *
+ * Scoped is the product's view: a goal belongs to its session, so a store opened
+ * for one session sees that session's lines and — when it is the session the
+ * directory-scoped goal last worked in — the unscoped lines written before this
+ * change. That is the migration, and it is deliberately narrow: **only the legacy
+ * room inherits.** Every other session starts with no goal, which is the whole
+ * point; adopting the unscoped lines for every session would leave the sharing
+ * behaviour exactly as it was.
+ *
+ * Unscoped is the legacy view - every line - which is what a directory-shaped
+ * fixture and every test written before the scope change folds.
+ */
+export function foldGoalLog(lines: readonly string[], sessionID?: string): GoalFoldState {
   let goal: GoalSnapshot | undefined
   let lastRef: GoalRef | undefined
   let usage: GoalUsage = EMPTY_USAGE
@@ -151,6 +201,11 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
   let usageGoalID: string | undefined
   /** Whether a delta has already been folded for `usageGoalID`. */
   let usageFromDelta = false
+  /** Whether a line of this session's own has been folded yet. */
+  let own = false
+  // Only the legacy room inherits the directory-scoped lines. A store for any other
+  // session starts empty, which is the behaviour the human asked for.
+  const inherits = sessionID !== undefined && legacyRoom(lines) === sessionID
   for (const line of lines) {
     if (line.trim().length === 0) continue
     let parsed: GoalLogLine
@@ -158,6 +213,14 @@ export function foldGoalLog(lines: readonly string[]): GoalFoldState {
       parsed = JSON.parse(line) as GoalLogLine
     } catch {
       continue // tolerate a torn tail write
+    }
+    if (sessionID !== undefined) {
+      const owner = lineSession(parsed)
+      if (owner === sessionID) own = true
+      // another session's line is never this session's business
+      else if (owner !== undefined) continue
+      // an unscoped line belongs to the legacy goal, which only its room inherits
+      else if (own || !inherits) continue
     }
     // A lease is a coordinate, not a state verb: it is folded into its own slot
     // and never reaches the goal accumulator, the revision, or `lastRef`. A
@@ -285,6 +348,8 @@ export class GoalStore {
   private readonly logPath: string
   private state: GoalFoldState
   private readonly runtime: RuntimeState
+  /** The session this store's goal belongs to, or undefined for the unscoped view. */
+  private readonly sessionID: string | undefined
   private seq = 0
   /**
    * The goal ref this store was born with (undefined when the log held no
@@ -295,13 +360,14 @@ export class GoalStore {
    */
   private readonly bornWith: GoalRef | undefined
 
-  constructor(worktree: string) {
+  constructor(worktree: string, sessionID?: string) {
     this.logPath = `${worktree}/.opencode/goal-log.jsonl`
+    this.sessionID = sessionID !== undefined && sessionID.length > 0 ? sessionID : undefined
     this.runtime = emptyRuntime()
     this.state = { goal: undefined, lastRef: undefined, lease: undefined, session: undefined }
     if (existsSync(this.logPath)) {
       const lines = readFileSync(this.logPath, 'utf8').split('\n')
-      this.state = foldGoalLog(lines)
+      this.state = foldGoalLog(lines, this.sessionID)
       this.seq = lines.filter(l => l.trim().length > 0).length
     }
     const born = this.state.goal
@@ -347,7 +413,7 @@ export class GoalStore {
     } catch {
       return // a concurrent append made the read fail; the next sync retries
     }
-    const folded = foldGoalLog(lines)
+    const folded = foldGoalLog(lines, this.sessionID)
     const previous = this.state.goal
     // The early return is what keeps a read cheap, and it has to cover
     // everything a reader depends on, not only the goal: `view()` reads the
@@ -568,6 +634,22 @@ export class GoalStore {
   }
 
   /**
+   * Append one line, stamped with the session this store's goal belongs to.
+   *
+   * Every write goes through here so the stamp cannot be forgotten at one site:
+   * a line without it is a line only the unscoped view can see, which would make
+   * a session's own goal invisible to itself.
+   */
+  private append(meta: GoalLogLine): void {
+    mkdirSync(dirname(this.logPath), { recursive: true })
+    appendFileSync(
+      this.logPath,
+      `${JSON.stringify({ ...meta, ...this.sessionID === undefined ? {} : { session: this.sessionID } })}\n`,
+    )
+    this.seq += 1
+  }
+
+  /**
    * Note that a goal turn ended with no tool call at all: the goal talked
    * without acting. A goal whose text keeps changing but whose hands stay still
    * is stalled, and the no-progress fingerprint — which resets the moment the
@@ -679,15 +761,14 @@ export class GoalStore {
    * touch the projection or the overlay the way every mutation does.
    */
   private appendUsage(ref: GoalRef, delta: GoalUsage): void {
-    mkdirSync(dirname(this.logPath), { recursive: true })
-    appendFileSync(this.logPath, `${JSON.stringify({
+    this.append({
       kind: 'goal/change',
       version: GOAL_CHANGE_VERSION,
       operation: 'usage',
       ref,
       delta,
       at: Date.now(),
-    })}\n`)
+    })
     this.usageOverlay = undefined
   }
 
@@ -713,9 +794,7 @@ export class GoalStore {
 
   /** Append one durable event and update the in-memory projection. */
   private commit(change: GoalSnapshotChangeMeta | GoalClearChangeMeta): void {
-    mkdirSync(dirname(this.logPath), { recursive: true })
-    appendFileSync(this.logPath, `${JSON.stringify(change)}\n`)
-    this.seq += 1
+    this.append(change)
     if (change.operation === 'clear') {
       this.state = { goal: undefined, lastRef: change.cleared, lease: undefined, session: undefined }
     } else {
@@ -744,15 +823,14 @@ export class GoalStore {
   holdRound(ref: GoalRef, holder: string, expiresAt: number): void {
     this.expectCurrent(ref)
     const at = Date.now()
-    mkdirSync(dirname(this.logPath), { recursive: true })
-    appendFileSync(this.logPath, `${JSON.stringify({
+    this.append({
       kind: 'goal/lease',
       version: GOAL_LEASE_VERSION,
       id: ref.id,
       holder,
       at,
       expiresAt: Math.max(expiresAt, at),
-    } satisfies GoalLeaseChangeMeta)}\n`)
+    } satisfies GoalLeaseChangeMeta)
     this.seq += 1
   }
 
@@ -771,16 +849,14 @@ export class GoalStore {
     const lease = this.state.lease
     if (lease !== undefined && lease.holder !== holder) return
     const at = Date.now()
-    mkdirSync(dirname(this.logPath), { recursive: true })
-    appendFileSync(this.logPath, `${JSON.stringify({
+    this.append({
       kind: 'goal/lease',
       version: GOAL_LEASE_VERSION,
       id: ref.id,
       holder,
       at,
       expiresAt: at,
-    } satisfies GoalLeaseChangeMeta)}\n`)
-    this.seq += 1
+    } satisfies GoalLeaseChangeMeta)
   }
 
   /**
@@ -840,16 +916,14 @@ export class GoalStore {
     // exists to prevent.
     const known = this.state.session?.sessionID === sessionID ? this.state.session.model : undefined
     const merged = model ?? known
-    mkdirSync(dirname(this.logPath), { recursive: true })
-    appendFileSync(this.logPath, `${JSON.stringify({
+    this.append({
       kind: 'goal/session',
       version: GOAL_SESSION_VERSION,
       id: ref.id,
       sessionID,
       ...merged === undefined ? {} : { model: merged },
       at,
-    } satisfies GoalSessionChangeMeta)}\n`)
-    this.seq += 1
+    } satisfies GoalSessionChangeMeta)
     this.state = { ...this.state, session: { kind: 'goal/session', version: GOAL_SESSION_VERSION, id: ref.id, sessionID, model: merged, at } }
   }
 

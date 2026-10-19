@@ -124,7 +124,7 @@ describe('ticket 27 — two processes on one goal log', () => {
     const second = await processOn(directory)
 
     // the human creates the goal through whichever process answers the tool
-    await first.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' })
+    await first.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' }, { sessionID: 'ses-shared' })
     for (const process of [first, second]) {
       process.queue.push({
         type: 'session.step.started',
@@ -188,7 +188,7 @@ describe('ticket 27 — two processes on one goal log', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lease-fold-'))
     cleanup.push(directory)
     const process = await processOn(directory)
-    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' })
+    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' }, { sessionID: 'ses-fold' })
     process.queue.push({
       type: 'session.step.started',
       data: { sessionID: 'ses-fold', info: { id: 'ses-fold', directory } },
@@ -219,7 +219,7 @@ describe('ticket 27 — two processes on one goal log', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lease-expiry-'))
     cleanup.push(directory)
     const process = await processOn(directory)
-    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' })
+    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' }, { sessionID: 'ses-expiry' })
     process.queue.push({
       type: 'session.step.started',
       data: { sessionID: 'ses-expiry', info: { id: 'ses-expiry', directory } },
@@ -255,7 +255,7 @@ describe('ticket 27 through the read path', () => {
     const process = await processOn(directory)
     const logPath = logPathFor(directory)
 
-    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' })
+    await process.tools.find(tool => tool.name === 'create_goal')!.execute({ objective: 'do a thing' }, { sessionID: 'ses-read' })
     process.queue.push({
       type: 'session.step.started',
       data: { sessionID: 'ses-read', info: { id: 'ses-read', directory } },
@@ -277,7 +277,10 @@ describe('ticket 27 through the read path', () => {
     // process did not see it happen — it only ever folds the log — so the lease
     // has to be visible through `sync()` or it is not visible at all.
     const { GoalStore } = await import('../src/state.ts')
-    const foreign = new GoalStore(directory)
+    // The foreign writer is scoped to the same session, because a goal belongs to
+    // its session: a lease written by a caller with no session is a lease no
+    // session's goal can see, which is the scope change working rather than a gap.
+    const foreign = new GoalStore(directory, 'ses-read')
     const goal = foreign.view()!
     appendFileSync(
       logPath,
@@ -288,6 +291,7 @@ describe('ticket 27 through the read path', () => {
         holder: 'a-process-that-wrote-the-log',
         at: Date.now(),
         expiresAt: Date.now() + 60_000,
+        session: 'ses-read',
       })}\n`,
     )
 

@@ -164,9 +164,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** Open a fresh store: every command folds the durable log from disk. */
-function openStore(directory: string): GoalStore {
-  return new GoalStore(directory)
+/**
+ * Open a fresh store for one session: every command folds the durable log from
+ * disk, and a goal belongs to the session rather than to the directory.
+ *
+ * A caller with no session — the sidebar rendering before a route is known — gets
+ * the directory-scoped store, which is the legacy shape and holds nothing once a
+ * session has written its own log.
+ */
+function openStore(directory: string, sessionID?: string): GoalStore {
+  return new GoalStore(directory, sessionID)
 }
 
 /** Whether the TUI's session data reports a running turn for one session. */
@@ -670,7 +677,11 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
             return
           }
           const command = parseGoalCommand(rawInput)
-          const store = openStore(dir)
+          // The command plane acts on the goal of the session the human is in. A
+          // goal belongs to its session, so `/goal status` in one session says
+          // nothing about another session's goal — which is the whole point of the
+          // scope change, and the reason a new session starts with no goal.
+          const store = openStore(dir, sessionID())
           const before = store.view()
 
           // a bare `/goal` with no goal yet: ask for the objective instead of printing usage
@@ -795,7 +806,7 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           const id = sessionID()
           const dir = directory()
           if (id.length === 0 || dir.length === 0) return
-          const store = openStore(dir)
+          const store = openStore(dir, id)
           const goal = store.view()
           if (goal === undefined || goal.phase !== 'active') return
           if (started.has(`${goal.id}:${id}`)) return
@@ -861,7 +872,7 @@ export function createGoalTuiPlugin(options: GoalTuiPluginOptions = {}) {
           append: 'sidebar.content',
           render: () => {
             tick() // re-render on every refresh tick
-            const goal = directory().length > 0 ? openStore(directory()).view() : undefined
+            const goal = directory().length > 0 ? openStore(directory(), sessionID()).view() : undefined
             return <GoalSidebarView goal={goal} onCommand={command => void runGoalCommand(command)} />
           },
         })

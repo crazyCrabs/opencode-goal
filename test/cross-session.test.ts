@@ -140,7 +140,7 @@ describe('a turn in another session of the same project', () => {
     const restore = silence()
     try {
       const server = await serverHalf(directory)
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-goal')
 
       // the human creates the goal, and the server driver starts round 1 in the
       // session that was just created — the goal's own room
@@ -182,7 +182,7 @@ describe('a turn in another session of the same project', () => {
     const restore = silence()
     try {
       const server = await serverHalf(directory)
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-goal')
       store.create('another objective', 25, 0)
       await server.created('ses-goal')
       await server.turnFinished('ses-goal')
@@ -208,7 +208,7 @@ describe('a turn in another session of the same project', () => {
     const restore = silence()
     try {
       const server = await serverHalf(directory)
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-goal')
       store.create('self-sustaining objective', 25, 0)
       await server.created('ses-goal')
 
@@ -238,7 +238,7 @@ describe('a turn in another session of the same project', () => {
     const restore = silence()
     try {
       const yesterdays = await serverHalf(directory)
-      await yesterdays.tool('create_goal').execute({ objective: 'yesterday objective' } as never)
+      await yesterdays.tool('create_goal').execute({ objective: 'yesterday objective' } as never, { sessionID: 'ses-old' })
       await yesterdays.stepStarted('ses-old')
       await yesterdays.cleanup()
 
@@ -266,7 +266,7 @@ describe('a turn in another session of the same project', () => {
     const restore = silence()
     try {
       const server = await serverHalf(directory)
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-goal')
       store.create('steal objective', 25, 0)
       await server.created('ses-goal')
       await server.turnFinished('ses-goal')

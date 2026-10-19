@@ -152,18 +152,37 @@ const UPDATE_ACTIONS = ['complete', 'blocked', 'pause', 'resume', 'edit'] as con
  */
 export function goalTools(
   root: string,
-  getStore: (directory: string) => GoalStore,
+  getStore: (directory: string, sessionID?: string) => GoalStore,
   commandsFor?: (directory: string) => readonly number[],
 ): readonly GoalTool[] {
-  /** Exit codes of commands that actually ran, or none when nobody is counting. */
+  /**
+ * The slice of `Tool.Context` the goal tools read.
+ *
+ * `sessionID` is the whole reason this exists: a goal belongs to the session
+ * that asked for it, and the second argument of every `execute` is the only
+ * place the plugin can learn which one that was. Declared structurally rather
+ * than imported so the tools do not grow a dependency on the host's tool types.
+ */
+type GoalToolContext = { readonly sessionID?: string }
+
+/** Exit codes of commands that actually ran, or none when nobody is counting. */
   const ranCommands = (directory: string): readonly number[] =>
     commandsFor === undefined ? [] : commandsFor(directory)
   const stores = new Map<string, GoalStore>()
-  const store = (): GoalStore => {
-    let cached = stores.get(root)
+  /**
+   * The store of the session a tool is running in.
+   *
+   * `Tool.Context` carries `sessionID` as the second argument of every `execute`,
+   * and the goal tools used to ignore it — so a goal the model created belonged to
+   * the directory rather than to the conversation that asked for it. A goal belongs
+   * to its session.
+   */
+  const store = (sessionID?: string): GoalStore => {
+    const key = sessionID === undefined || sessionID.length === 0 ? root : `${root}\u0000${sessionID}`
+    let cached = stores.get(key)
     if (cached === undefined) {
-      cached = getStore(root)
-      stores.set(root, cached)
+      cached = getStore(root, sessionID)
+      stores.set(key, cached)
     }
     return cached
   }
@@ -178,8 +197,8 @@ export function goalTools(
         properties: {},
         additionalProperties: false,
       },
-      async execute() {
-        return { content: JSON.stringify(goalValue(store().view())) }
+      async execute(_input: unknown, context?: GoalToolContext) {
+        return { content: JSON.stringify(goalValue(store(context?.sessionID).view())) }
       },
     },
 
@@ -209,9 +228,9 @@ export function goalTools(
         required: ['objective'],
         additionalProperties: false,
       },
-      async execute(rawArgs: unknown) {
+      async execute(rawArgs: unknown, context?: GoalToolContext) {
         const args = (rawArgs ?? {}) as RawArgs
-        const view = store().create(
+        const view = store(context?.sessionID).create(
           requireString(args, 'objective'),
           optionalNumber(args, 'max_goal_rounds') ?? GoalStore.DEFAULT_MAX_GOAL_ROUNDS,
           optionalNumber(args, 'token_budget') ?? 0,
@@ -283,7 +302,7 @@ export function goalTools(
         required: ['action'],
         additionalProperties: false,
       },
-      async execute(rawArgs: unknown) {
+      async execute(rawArgs: unknown, context?: GoalToolContext) {
         const args = (rawArgs ?? {}) as RawArgs
         const action = requireString(args, 'action')
         if (!(UPDATE_ACTIONS as readonly string[]).includes(action)) {
@@ -295,7 +314,7 @@ export function goalTools(
         // compare-and-set the ref feeds is exactly as strong when the server
         // reads the current one. Reading it later is also fresher than the model
         // reading it at the start of its turn.
-        const goalStore = store()
+        const goalStore = store(context?.sessionID)
         const goal = goalStore.current
         if (goal === undefined) {
           throw new GoalError('GOAL_NOT_FOUND', 'no goal in this project; call create_goal first')
@@ -309,13 +328,13 @@ export function goalTools(
               throw new GoalError('GOAL_INVALID_EDIT', 'edit requires objective and/or max_goal_rounds')
             }
             return {
-              content: JSON.stringify(goalValue(store().edit(ref, objective, maxGoalRounds))),
+              content: JSON.stringify(goalValue(store(context?.sessionID).edit(ref, objective, maxGoalRounds))),
             }
           }
           case 'pause':
-            return { content: JSON.stringify(goalValue(store().pause(ref))) }
+            return { content: JSON.stringify(goalValue(store(context?.sessionID).pause(ref))) }
           case 'resume':
-            return { content: JSON.stringify(goalValue(store().resume(ref))) }
+            return { content: JSON.stringify(goalValue(store(context?.sessionID).resume(ref))) }
           case 'complete': {
             // A claim with no criteria is refused rather than recorded: an
             // objective nobody checked against is not an achieved objective.
@@ -368,7 +387,7 @@ export function goalTools(
             // same impasse must persist three consecutive rounds before the goal
             // stops. The prompt already asks for that; this is what enforces it.
             const reason = { code: 'model-reported' as const, message: blockedReason.trim() }
-            const goalStore = store()
+            const goalStore = store(context?.sessionID)
             goalStore.noteJudgment(reason.message)
             const gated = gateBlock(goalStore, reason)
             if (gated === undefined) {
@@ -409,7 +428,7 @@ export function goalTools(
         required: ['reason', 'resume_after_ms'],
         additionalProperties: false,
       },
-      async execute(rawArgs: unknown) {
+      async execute(rawArgs: unknown, context?: GoalToolContext) {
         const args = (rawArgs ?? {}) as RawArgs
         // The deadline is required, not optional-with-a-default: an unbounded wait
         // is a goal nobody hears from again, and the tool cannot express one.
@@ -418,13 +437,13 @@ export function goalTools(
           throw new GoalError('GOAL_INVALID_EDIT', 'resume_after_ms is required and must be a positive number of milliseconds')
         }
         // Resolved here, like every other mutation: the model quotes no ref.
-        const goal = store().current
+        const goal = store(context?.sessionID).current
         if (goal === undefined) {
           throw new GoalError('GOAL_NOT_FOUND', 'no goal in this project; call create_goal first')
         }
         return {
           content: JSON.stringify(
-            goalValue(store().wait({ id: goal.id, revision: goal.revision }, requireString(args, 'reason'), deadline)),
+            goalValue(store(context?.sessionID).wait({ id: goal.id, revision: goal.revision }, requireString(args, 'reason'), deadline)),
           ),
         }
       },

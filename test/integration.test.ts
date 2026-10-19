@@ -15,7 +15,8 @@ import { GoalStore } from '../src/state.ts'
 /** One goal tool as the plugin registers it (opencode 2.x tool shape). */
 interface RegisteredTool {
   name: string
-  execute(args: unknown): Promise<{ content: string }>
+  /** As the host invokes it: with the session the tool is running in. */
+  execute(args: unknown, context?: { sessionID?: string }): Promise<{ content: string }>
 }
 
 /** One system-prompt hook event. */
@@ -183,7 +184,22 @@ async function serverHalf(directory: string) {
 
   return {
     prompts,
-    tool: (name: string): RegisteredTool => tools.find(tool => tool.name === name)!,
+    /**
+     * A tool as the host invokes it.
+     *
+     * The session is the second argument of every real `execute`, and it is what
+     * makes a goal belong to the conversation that asked for it. A test that
+     * omits it gets `ses-integration`, the TUI's room, which is what most of these
+     * tests mean; a test about another session names it.
+     */
+    tool: (name: string, sessionID = 'ses-integration'): RegisteredTool => {
+      const found = tools.find(tool => tool.name === name)!
+      return {
+        name: found.name,
+        execute: (args: unknown, context?: { sessionID?: string }) =>
+          found.execute(args, { sessionID: context?.sessionID ?? sessionID }),
+      }
+    },
     /** Emit one `session.idle` event and wait for the driver to finish. */
     idle: async (sessionID: string): Promise<void> => {
       queue.push({ type: 'session.idle', data: { sessionID }, location: { directory } })
@@ -402,10 +418,10 @@ describe('a completion claim is cross-checked against the event stream', () => {
     try {
       const server = await serverHalf(directory)
       await server.tool('create_goal').execute({ objective: 'claim objective' }, {} as never)
-      await server.stepStarted('ses-claim')
+      await server.stepStarted('ses-integration')
 
       // the model runs the command; the event stream records that it ran
-      await server.commandRan('ses-claim', 'call-1', 0)
+      await server.commandRan('ses-integration', 'call-1', 0)
 
       const result = JSON.parse(
         (
@@ -426,7 +442,7 @@ describe('a completion claim is cross-checked against the event stream', () => {
     try {
       const server = await serverHalf(directory)
       await server.tool('create_goal').execute({ objective: 'claim objective' }, {} as never)
-      await server.stepStarted('ses-claim2')
+      await server.stepStarted('ses-integration')
 
       // nothing ran, but the model claims it did
       const result = JSON.parse(
@@ -448,10 +464,10 @@ describe('a completion claim is cross-checked against the event stream', () => {
     try {
       const server = await serverHalf(directory)
       await server.tool('create_goal').execute({ objective: 'claim objective' }, {} as never)
-      await server.stepStarted('ses-claim3')
+      await server.stepStarted('ses-integration')
 
       // the command ran and failed, but the claim says it passed
-      await server.commandRan('ses-claim3', 'call-2', 1)
+      await server.commandRan('ses-integration', 'call-2', 1)
       const result = JSON.parse(
         (
           await server.tool('update_goal').execute({ action: 'complete', claim: CLAIM }, {} as never)
@@ -473,7 +489,7 @@ describe('the external wait is durable and woken by a human', () => {
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
       await first.stepStarted('ses-wait')
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-integration')
       const ref = { id: store.view()!.id, revision: store.view()!.revision }
       store.wait(ref, 'waiting for the platform review', 60_000)
 
@@ -502,7 +518,7 @@ describe('the external wait is durable and woken by a human', () => {
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
       await server.stepStarted('ses-integration')
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-integration')
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
 
       // suppressed while the wait stands: the command plane's own first kick is
@@ -538,7 +554,7 @@ describe('the external wait is durable and woken by a human', () => {
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
       await server.stepStarted('ses-integration')
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-integration')
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
 
       // The live v2 server reports this event with no location. Before ticket 25
@@ -568,7 +584,7 @@ describe('the external wait is durable and woken by a human', () => {
       const server = await serverHalf(directory)
       const tui = tuiHalf(directory)
       await tui.command.run('waiting objective')
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-integration')
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting for the platform review', 60_000)
 
       // a subagent session, in this project, whose inbox item carries no
@@ -579,8 +595,8 @@ describe('the external wait is durable and woken by a human', () => {
       expect(new GoalStore(directory).view()!.waitUntil).toBeGreaterThan(0)
 
       // and the human still wakes it
-      await server.stepStarted('ses-parent-session')
-      await server.inboxArrivedBare('ses-parent-session', 'the human arrived')
+      await server.stepStarted('ses-integration')
+      await server.inboxArrivedBare('ses-integration', 'the human arrived')
       expect(new GoalStore(directory).view()!.waitUntil).toBe(0)
 
       tui.cleanup()
@@ -603,7 +619,7 @@ describe('the external wait is durable and woken by a human', () => {
       // same session here-and-elsewhere, as this helper call used to, is a state
       // no real session can be in, and the resolver reads the map first.
       await server.stepStarted('ses-other', other)
-      const store = new GoalStore(directory)
+      const store = new GoalStore(directory, 'ses-integration')
       store.wait({ id: store.view()!.id, revision: store.view()!.revision }, 'waiting', 60_000)
 
       // a human arriving in a different project
@@ -739,21 +755,29 @@ describe('TUI command plane + server driver', () => {
       expect(tui.toasts.some(toast => toast.message.includes('Goal created'))).toBe(true)
 
       // the model tools read the same durable goal
-      const read = JSON.parse((await server.tool('get_goal').execute({})).content)
+      const read = JSON.parse((await server.tool('get_goal', 'ses-integration').execute({})).content)
       expect(read.goal.objective).toBe('integrate the halves')
       expect(read.goal.roundsStarted).toBe(1)
 
       // the system prompt carries the active goal
       expect(await server.system('ses-integration')).toContain('integrate the halves')
 
-      // the working round ends: the server driver adopts the TUI-created goal
-      await server.idle('ses-integration')
+      // the working round ends: the server driver adopts the TUI-created goal.
+      // The vehicle is the turn-completion event, not `session.idle` — the live
+      // server never publishes an idle (ticket 22), and the adoption an idle
+      // used to perform came from the store existing before the goal did, a
+      // trick a per-session store cannot repeat.
+      await server.turnFinished('ses-integration')
       expect(server.prompts.length).toBe(1)
       expect(server.prompts[0].text).toContain('round 2/25')
       expect(server.prompts[0].text).toContain('integrate the halves')
 
       // and it keeps going when that round's turn reports back, with no
-      // further user action; an idle arriving mid-round admits nothing
+      // further user action; an idle arriving mid-round admits nothing. The
+      // round acts first, so the no-tool-call stall guard — which a
+      // turn-completion vehicle feeds and an idle one did not — stays quiet
+      // and only the self-sustaining property is under test.
+      await server.toolCalled('ses-integration', 'call-integrate-2')
       await server.idle('ses-integration')
       expect(server.prompts.length).toBe(1)
       await server.turnFinished('ses-integration')
@@ -798,7 +822,7 @@ describe('TUI command plane + server driver', () => {
     try {
       // yesterday: a goal was created and left active
       const previous = await serverHalf(directory)
-      await previous.tool('create_goal').execute({ objective: 'yesterday objective' })
+      await previous.tool('create_goal', 'ses-restart').execute({ objective: 'yesterday objective' })
       await previous.cleanup()
 
       // today: a fresh server process materializes its store. The goal only
@@ -836,13 +860,20 @@ describe('TUI command plane + server driver', () => {
       await server.createdList('ses-third')
       expect(server.prompts.length).toBe(3)
 
-      // the human interrupts round 3: no next round is admitted, and the next
-      // session to open adopts the goal and carries on from there
+      // the human interrupts round 3: no next round is admitted, and the goal
+      // waits for a human turn in its own session. A session opened instead of
+      // that one correctly inherits nothing — the goal belongs to ses-restart.
       await server.turnFinished('ses-restart', 'interrupted', 'user')
       expect(server.prompts.length).toBe(3)
       await server.created('ses-fourth')
+      expect(server.prompts.length).toBe(3)
+      // the human's own turn is the go-ahead: round 4 runs where the goal works.
+      // The round acts first, so the stall guard — which counts the
+      // interrupted turn and this one, both tool-less — stays quiet.
+      await server.toolCalled('ses-restart', 'call-restart-3')
+      await server.turnFinished('ses-restart')
       expect(server.prompts.length).toBe(4)
-      expect(server.prompts[3].sessionID).toBe('ses-fourth')
+      expect(server.prompts[3].sessionID).toBe('ses-restart')
       expect(server.prompts[3].text).toContain('round 4/25')
 
       await server.cleanup()
@@ -858,7 +889,7 @@ describe('TUI command plane + server driver', () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-integration-loop-'))
     try {
       const server = await serverHalf(directory)
-      await server.tool('create_goal').execute({ objective: 'loop objective' })
+      await server.tool('create_goal', 'ses-loop').execute({ objective: 'loop objective' })
       await server.created('ses-loop')
 
       // each finished turn admits exactly one more round, with no human input
@@ -948,7 +979,7 @@ describe('a goal that predates the process is re-armed by a human turn', () => {
     try {
       // yesterday: the goal was created, and a session was opened for it
       const yesterdays = await serverHalf(directory)
-      await yesterdays.tool('create_goal').execute({ objective: 'yesterday objective' })
+      await yesterdays.tool('create_goal', 'ses-old').execute({ objective: 'yesterday objective' })
       await yesterdays.stepStarted('ses-old')
       await yesterdays.cleanup()
 
@@ -984,7 +1015,7 @@ describe('a goal that predates the process is re-armed by a human turn', () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-adopt-interrupt-'))
     try {
       const yesterday = await serverHalf(directory)
-      await yesterday.tool('create_goal').execute({ objective: 'interrupted objective' })
+      await yesterday.tool('create_goal', 'ses-int').execute({ objective: 'interrupted objective' })
       await yesterday.stepStarted('ses-int')
       await yesterday.cleanup()
 

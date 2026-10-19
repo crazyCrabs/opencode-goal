@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeAll } from 'bun:test'
-import { appendFileSync, mkdirSync, mkdtempSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GoalStore } from '../src/state.ts'
@@ -129,5 +129,62 @@ describe('cross-writer log sync (TUI command plane <-> server driver)', () => {
     const store = new GoalStore(legacyDir)
     expect(store.view()?.tokenBudget).toBe(0)
     expect(store.view()?.objective).toBe('legacy objective')
+  })
+})
+
+describe('a directory-scoped goal is inherited by exactly one session', () => {
+  /**
+   * The migration, and the reason it is narrow.
+   *
+   * A goal written before the log became session-scoped carries no session on any
+   * line, so there is nothing to attribute it to except the room it last worked
+   * in — the `goal/session` coordinate. That one session inherits it, which is what
+   * keeps a live goal alive through the change rather than silently orphaning it.
+   *
+   * Every other session starts with no goal. Adopting the legacy lines for all of
+   * them would leave the sharing behaviour exactly as it was, which is the thing
+   * the human asked to remove.
+   */
+  test('the room inherits, and every other session starts empty', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-store4-legacy-'))
+    try {
+      // a goal written the old way: no session on any line, and a room recorded by
+      // the coordinate ticket 28 added
+      const legacy = new GoalStore(directory)
+      legacy.create('a goal from before the scope change', 25, 0)
+      const ref = { id: legacy.view()!.id, revision: legacy.view()!.revision }
+      legacy.continue(ref)
+      legacy.rememberSession({ id: legacy.view()!.id, revision: legacy.view()!.revision }, 'ses-room')
+
+      const room = new GoalStore(directory, 'ses-room')
+      expect(room.view()?.id).toBe(legacy.view()!.id)
+      expect(room.view()?.roundsStarted).toBe(1)
+      expect(room.view()?.objective).toBe('a goal from before the scope change')
+
+      // and the room can carry on in its own store
+      room.continue({ id: room.view()!.id, revision: room.view()!.revision })
+      expect(new GoalStore(directory, 'ses-room').view()?.roundsStarted).toBe(2)
+
+      const other = new GoalStore(directory, 'ses-somewhere-else')
+      expect(other.view()).toBeUndefined()
+      // it is not merely hidden: a mutation there is its own goal, not the legacy one
+      other.create('a goal of its own', 5, 0)
+      expect(other.view()?.objective).toBe('a goal of its own')
+      expect(new GoalStore(directory, 'ses-room').view()?.objective).toBe('a goal from before the scope change')
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('a session with no legacy room at all starts empty', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-store4-noroom-'))
+    try {
+      // a directory-scoped goal with no recorded room: nobody can be attributed it,
+      // so nobody inherits it
+      new GoalStore(directory).create('an unattributable goal', 25, 0)
+      expect(new GoalStore(directory, 'ses-any').view()).toBeUndefined()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })

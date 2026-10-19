@@ -74,8 +74,8 @@ export interface DriverSessionApi {
 }
 
 export interface DriverHooks {
-  /** Session store resolver: one store per project directory. */
-  getStore(directory: string): GoalStore
+  /** Session store resolver: one store per session, because a goal belongs to its session. */
+  getStore(directory: string, sessionID?: string): GoalStore
   session: DriverSessionApi
   log(message: string, extra?: Record<string, unknown>): void
 }
@@ -127,12 +127,19 @@ export class GoalDriver {
     this.storeFor(directory)
   }
 
-  /** Resolve (and cache) the store for one project directory. */
-  storeFor(directory: string): GoalStore {
-    let store = this.stores.get(directory)
+  /**
+   * Resolve (and cache) the store for one session.
+   *
+   * Keyed by session, not by directory, because a goal belongs to its session:
+   * two sessions in one worktree hold two goals, and caching one store per
+   * directory would hand both of them the same goal.
+   */
+  storeFor(directory: string, sessionID?: string): GoalStore {
+    const key = sessionID === undefined || sessionID.length === 0 ? directory : `${directory}\u0000${sessionID}`
+    let store = this.stores.get(key)
     if (store === undefined) {
-      store = this.hooks.getStore(directory)
-      this.stores.set(directory, store)
+      store = this.hooks.getStore(directory, sessionID)
+      this.stores.set(key, store)
     }
     return store
   }
@@ -147,7 +154,7 @@ export class GoalDriver {
   async onSessionCreated(sessionID: string, directory: string): Promise<void> {
     if (this.started.has(sessionID) || this.forgotten.has(sessionID)) return
     this.started.add(sessionID)
-    const store = this.storeFor(directory)
+    const store = this.storeFor(directory, sessionID)
     const goal = store.view()
     if (goal === undefined || goal.phase !== 'active') return
     // The goal has a room of its own from here on, whichever way this call ends.
@@ -203,7 +210,7 @@ export class GoalDriver {
    */
   adoptOnHumanTurn(sessionID: string, directory: string): void {
     if (this.isGoalTurn(sessionID)) return
-    const store = this.storeFor(directory)
+    const store = this.storeFor(directory, sessionID)
     const goal = store.view()
     if (goal === undefined || goal.phase !== 'active') return
     // an already-armed goal needs nothing: this is a re-arm, not a resume
@@ -308,7 +315,7 @@ export class GoalDriver {
     // a goal round is mid-turn in this session: its completion event admits
     // the next round, and `session.idle` can fire without a turn finishing
     if (this.roundsInFlight.has(sessionID)) return
-    const store = this.storeFor(directory)
+    const store = this.storeFor(directory, sessionID)
     await this.drive(store, sessionID, directory)
   }
 
@@ -317,7 +324,7 @@ export class GoalDriver {
     // Asked before the round is released, because releasing it is what makes
     // `isGoalTurn` forget this session ever had one.
     const mine = this.ownsTurn(sessionID, directory)
-    const store = this.storeFor(directory)
+    const store = this.storeFor(directory, sessionID)
     // the turn that was in flight is over: release the round before admitting
     // the next one, whether or not this session's turn is admitted again
     this.releaseRound(sessionID, directory)
@@ -521,7 +528,7 @@ export class GoalDriver {
    */
   ownsTurn(sessionID: string, directory: string): boolean {
     if (this.roundsInFlight.has(sessionID)) return true
-    const store = this.storeFor(directory)
+    const store = this.storeFor(directory, sessionID)
     const room = store.session
     if (room !== undefined) return room.sessionID === sessionID
     return true
@@ -561,7 +568,7 @@ export class GoalDriver {
    */
   renewLeaseFor(sessionID: string, directory: string): void {
     if (!this.isGoalTurn(sessionID)) return
-    const store = this.storeFor(directory)
+    const store = this.storeFor(directory, sessionID)
     const goal = store.view()
     if (goal === undefined) return
     store.renewLeaseIfDue({ id: goal.id, revision: goal.revision }, this.holder, LEASE_WINDOW_MS)

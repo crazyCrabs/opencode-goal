@@ -94,7 +94,7 @@ export interface TextPart {
 
 export interface GoalAccountingHooks {
   /** The goal store for one project directory. */
-  storeFor(directory: string): GoalStore
+  storeFor(directory: string, sessionID?: string): GoalStore
   /**
    * Whether the turn now running in a session is one this plugin submitted a
    * continuation prompt for — a goal round, as opposed to a human turn.
@@ -162,7 +162,7 @@ export class GoalAccounting {
    * of the bill it landed in.
    */
   onStepEnded(directory: string, data: StepEndedData, durableSeq?: number): void {
-    const store = this.hooks.storeFor(directory)
+    const store = this.hooks.storeFor(directory, data.sessionID)
     if (store.view() === undefined) return
     const sessionID = data.sessionID
     if (sessionID !== undefined && this.alreadyFolded(sessionID, durableSeq)) return
@@ -214,13 +214,13 @@ export class GoalAccounting {
    */
   onToolActivity(directory: string, sessionID: string): void {
     if (sessionID !== undefined) this.toolCallThisTurn.add(sessionID)
-    const store = this.hooks.storeFor(directory)
+    const store = this.hooks.storeFor(directory, sessionID)
     if (store.view() === undefined) return
     store.noteToolCall()
   }
 
   onTurnEnded(directory: string, sessionID: string, failed = false, belongsToGoal = true): void {
-    const store = this.hooks.storeFor(directory)
+    const store = this.hooks.storeFor(directory, sessionID)
     if (store.view() === undefined) {
       this.toolCallThisTurn.delete(sessionID)
       return
@@ -258,7 +258,7 @@ export class GoalAccounting {
    * success with no exit code is not a command and records nothing.
    */
   onToolSuccess(directory: string, data: ToolSuccessData): void {
-    const store = this.hooks.storeFor(directory)
+    const store = this.hooks.storeFor(directory, data.sessionID)
     const goal = store.view()
     if (goal === undefined) return
     const exit = data.metadata?.exit
