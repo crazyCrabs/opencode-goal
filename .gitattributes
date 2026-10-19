@@ -1,0 +1,25 @@
+# Normalize every text file to LF in both the index and the working tree.
+#
+# The tree was mixed: 76 files checked out CRLF and 38 as LF, under
+# `core.autocrlf=true` with no attribute file to say which was intended. That mix
+# is what made exact-match editing unreliable — a patch written against one file's
+# convention silently failed against another's — and the workaround it produced
+# (newline-agnostic scripts) is what corrupted source files more than once.
+#
+# The index was already LF for every tracked file, so checking these out as LF
+# changes no content: the conversion shows up as an empty diff.
+* text=auto eol=lf
+
+# Anything binary is declared rather than detected, so a future asset cannot be
+# silently mangled by the rule above.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.woff binary
+*.woff2 binary
